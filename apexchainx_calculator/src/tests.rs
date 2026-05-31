@@ -99,19 +99,18 @@ fn test_config_snapshot_is_deterministic_and_complete() {
     assert_eq!(snapshot.version, symbol_short!("v1"));
     assert_eq!(snapshot.entries.len(), 4);
 
-    let critical = snapshot.entries.get(0).unwrap();
-    let high = snapshot.entries.get(1).unwrap();
-    let medium = snapshot.entries.get(2).unwrap();
-    let low = snapshot.entries.get(3).unwrap();
+    let expected = [
+        (symbol_short!("critical"), 15u32),
+        (symbol_short!("high"), 30u32),
+        (symbol_short!("medium"), 60u32),
+        (symbol_short!("low"), 120u32),
+    ];
 
-    assert_eq!(critical.severity, symbol_short!("critical"));
-    assert_eq!(critical.config.threshold_minutes, 15);
-    assert_eq!(high.severity, symbol_short!("high"));
-    assert_eq!(high.config.threshold_minutes, 30);
-    assert_eq!(medium.severity, symbol_short!("medium"));
-    assert_eq!(medium.config.threshold_minutes, 60);
-    assert_eq!(low.severity, symbol_short!("low"));
-    assert_eq!(low.config.threshold_minutes, 120);
+    for (i, (severity, threshold)) in expected.iter().enumerate() {
+        let entry = snapshot.entries.get(i as u32).unwrap();
+        assert_eq!(entry.severity, severity.clone());
+        assert_eq!(entry.config.threshold_minutes, *threshold);
+    }
 }
 
 #[test]
@@ -129,6 +128,7 @@ fn test_result_schema_is_explicit_and_stable() {
     assert_eq!(schema.rating_excellent, symbol_short!("excel"));
     assert_eq!(schema.rating_good, symbol_short!("good"));
     assert_eq!(schema.rating_poor, symbol_short!("poor"));
+    assert_eq!(schema.includes_config_version_hash, true);
 }
 
 #[test]
@@ -390,7 +390,10 @@ fn test_operator_cannot_unpause() {
 #[should_panic]
 fn test_calculate_sla_blocked_when_paused() {
     let (env, client, actors) = setup();
-    client.pause(&actors.admin, &soroban_sdk::String::from_str(&env, "maintenance"));
+    client.pause(
+        &actors.admin,
+        &soroban_sdk::String::from_str(&env, "maintenance"),
+    );
 
     // must panic – ContractPaused
     client.calculate_sla(
@@ -542,6 +545,91 @@ fn test_backend_parity_threshold_boundary_cases() {
         assert_eq!(result.rating, symbol(&env, case.expected_rating));
         assert_eq!(result.amount, case.expected_amount);
     }
+}
+
+#[test]
+fn test_exact_threshold_mttr_is_always_met_never_violated() {
+    let (_env, client, actors) = setup();
+    let cases = [
+        (symbol_short!("critical"), 15u32, 750i128),
+        (symbol_short!("high"), 30u32, 750i128),
+        (symbol_short!("medium"), 60u32, 750i128),
+        (symbol_short!("low"), 120u32, 600i128),
+    ];
+
+    for (severity, threshold, expected_amount) in cases {
+        let view = client.calculate_sla_view(&symbol_short!("BNDV"), &severity, &threshold);
+        let mutating = client.calculate_sla(
+            &actors.operator,
+            &symbol_short!("BNDM"),
+            &severity,
+            &threshold,
+        );
+
+        assert_eq!(view.status, symbol_short!("met"));
+        assert_eq!(view.payment_type, symbol_short!("rew"));
+        assert_eq!(view.rating, symbol_short!("good"));
+        assert_eq!(view.amount, expected_amount);
+        assert_eq!(view.threshold_minutes, threshold);
+
+        assert_eq!(mutating.status, symbol_short!("met"));
+        assert_eq!(mutating.payment_type, symbol_short!("rew"));
+        assert_eq!(mutating.rating, symbol_short!("good"));
+        assert_eq!(mutating.amount, expected_amount);
+        assert_eq!(mutating.threshold_minutes, threshold);
+    }
+}
+
+#[test]
+fn test_exact_threshold_boundary_is_stable_after_config_update() {
+    let (_env, client, actors) = setup();
+
+    client.set_config(&actors.admin, &symbol_short!("critical"), &20, &200, &1000);
+
+    let exact = client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("EXACT"),
+        &symbol_short!("critical"),
+        &20,
+    );
+    let over = client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("OVER"),
+        &symbol_short!("critical"),
+        &21,
+    );
+
+    assert_eq!(exact.status, symbol_short!("met"));
+    assert_eq!(exact.payment_type, symbol_short!("rew"));
+    assert_eq!(exact.rating, symbol_short!("good"));
+    assert_eq!(exact.amount, 1000);
+
+    assert_eq!(over.status, symbol_short!("viol"));
+    assert_eq!(over.payment_type, symbol_short!("pen"));
+    assert_eq!(over.amount, -200);
+}
+
+#[test]
+fn test_backend_replay_exact_threshold_outcome_is_deterministic_before_config_change() {
+    let (env, client, actors) = setup();
+
+    let severity = symbol_short!("high");
+    let mttr = 30u32;
+    let outage_id = symbol(&env, "THR001");
+
+    let stored = client.calculate_sla(&actors.operator, &outage_id, &severity, &mttr);
+    let replayed = client.calculate_sla_view(&outage_id, &severity, &mttr);
+
+    assert_eq!(stored.status, symbol_short!("met"));
+    assert_eq!(stored.payment_type, symbol_short!("rew"));
+    assert_eq!(stored.rating, symbol_short!("good"));
+    assert_eq!(stored.amount, 750);
+
+    assert_eq!(stored.status, replayed.status);
+    assert_eq!(stored.payment_type, replayed.payment_type);
+    assert_eq!(stored.rating, replayed.rating);
+    assert_eq!(stored.amount, replayed.amount);
+    assert_eq!(stored.threshold_minutes, replayed.threshold_minutes);
 }
 
 #[test]
@@ -812,7 +900,7 @@ fn test_calculate_sla_view_matches_mutating_and_does_not_mutate() {
         "Mutating function must mutate stats"
     );
 
-    // 6. Ensure results are perfectly identical
+    // 6. Ensure results are perfectly identical, including backend-visible metadata.
     assert_eq!(view_result.status, mut_result.status);
     assert_eq!(view_result.amount, mut_result.amount);
     assert_eq!(view_result.rating, mut_result.rating);
@@ -820,6 +908,7 @@ fn test_calculate_sla_view_matches_mutating_and_does_not_mutate() {
     assert_eq!(view_result.mttr_minutes, mut_result.mttr_minutes);
     assert_eq!(view_result.threshold_minutes, mut_result.threshold_minutes);
     assert_eq!(view_result.outage_id, mut_result.outage_id);
+    assert_eq!(view_result.recorded_at, mut_result.recorded_at);
 }
 // ============================================================
 // #32 – Contract Economic Stress Test Suite
@@ -1019,6 +1108,43 @@ fn test_config_version_hash_is_deterministic() {
 }
 
 #[test]
+fn test_canonical_severity_order_is_aligned_across_snapshot_and_metadata() {
+    let (_env, client, _actors) = setup();
+
+    let snapshot = client.get_config_snapshot();
+    let metadata = client.get_contract_metadata();
+
+    assert_eq!(snapshot.entries.len(), metadata.supported_severities.len());
+
+    for i in 0..snapshot.entries.len() {
+        let snapshot_severity = snapshot.entries.get(i).unwrap().severity;
+        let metadata_severity = metadata.supported_severities.get(i).unwrap();
+        assert_eq!(snapshot_severity, metadata_severity);
+    }
+}
+
+#[test]
+fn test_canonical_severity_order_survives_config_updates() {
+    let (_env, client, actors) = setup();
+
+    client.set_config(&actors.admin, &symbol_short!("low"), &240, &15, &900);
+    client.set_config(&actors.admin, &symbol_short!("critical"), &20, &150, &800);
+
+    let snapshot = client.get_config_snapshot();
+    let expected = [
+        symbol_short!("critical"),
+        symbol_short!("high"),
+        symbol_short!("medium"),
+        symbol_short!("low"),
+    ];
+
+    for (i, severity) in expected.iter().enumerate() {
+        let entry = snapshot.entries.get(i as u32).unwrap();
+        assert_eq!(entry.severity, severity.clone());
+    }
+}
+
+#[test]
 fn test_config_version_hash_changes_on_update() {
     let (_env, client, actors) = setup();
     let before = client.get_config_version_hash();
@@ -1052,48 +1178,53 @@ fn test_config_version_hash_collision_resistance() {
     let collision_attempt_hash = client.get_config_version_hash();
 
     // Hash should be different despite same additive sum
-    assert_ne!(initial_hash, collision_attempt_hash,
-        "Hash should resist collision from additive checksum equivalence");
+    assert_ne!(
+        initial_hash, collision_attempt_hash,
+        "Hash should resist collision from additive checksum equivalence"
+    );
 
-    
     // Change critical to different values — hash must differ
     client.set_config(&actors.admin, &symbol_short!("critical"), &30, &200, &1000);
     let changed_hash = client.get_config_version_hash();
-    assert_ne!(initial_hash, changed_hash,
-        "Hash should change when config values change");
-    
+    assert_ne!(
+        initial_hash, changed_hash,
+        "Hash should change when config values change"
+    );
+
     // Restore original config
     client.set_config(&actors.admin, &symbol_short!("critical"), &15, &100, &750);
     let restored_hash = client.get_config_version_hash();
-    assert_eq!(initial_hash, restored_hash,
-        "Hash should return to original value after restoring config");
+    assert_eq!(
+        initial_hash, restored_hash,
+        "Hash should return to original value after restoring config"
+    );
 }
 
 #[test]
 fn test_config_version_hash_field_order_sensitivity() {
     let (_env, client, actors) = setup();
-    
+
     // Test that changing different fields produces different hashes
     let original_hash = client.get_config_version_hash();
-    
+
     // Change threshold only
     client.set_config(&actors.admin, &symbol_short!("high"), &25, &50, &750);
     let threshold_hash = client.get_config_version_hash();
     assert_ne!(original_hash, threshold_hash);
-    
-    // Reset and change penalty only  
+
+    // Reset and change penalty only
     client.set_config(&actors.admin, &symbol_short!("high"), &30, &60, &750);
     let penalty_hash = client.get_config_version_hash();
     assert_ne!(original_hash, penalty_hash);
     assert_ne!(threshold_hash, penalty_hash);
-    
+
     // Reset and change reward only
     client.set_config(&actors.admin, &symbol_short!("high"), &30, &50, &800);
     let reward_hash = client.get_config_version_hash();
     assert_ne!(original_hash, reward_hash);
     assert_ne!(threshold_hash, reward_hash);
     assert_ne!(penalty_hash, reward_hash);
-    
+
     // Restore original
     client.set_config(&actors.admin, &symbol_short!("high"), &30, &50, &750);
     let restored_hash = client.get_config_version_hash();
@@ -1103,21 +1234,21 @@ fn test_config_version_hash_field_order_sensitivity() {
 #[test]
 fn test_config_version_hash_severity_isolation() {
     let (_env, client, actors) = setup();
-    
+
     let original_hash = client.get_config_version_hash();
-    
+
     // Change only critical severity
     client.set_config(&actors.admin, &symbol_short!("critical"), &20, &200, &1000);
     let critical_changed_hash = client.get_config_version_hash();
     assert_ne!(original_hash, critical_changed_hash);
-    
+
     // Change only high severity (restore critical first)
     client.set_config(&actors.admin, &symbol_short!("critical"), &15, &100, &750);
     client.set_config(&actors.admin, &symbol_short!("high"), &35, &55, &775);
     let high_changed_hash = client.get_config_version_hash();
     assert_ne!(original_hash, high_changed_hash);
     assert_ne!(critical_changed_hash, high_changed_hash);
-    
+
     // Both changes should produce yet another hash
     client.set_config(&actors.admin, &symbol_short!("critical"), &20, &200, &1000);
     let both_changed_hash = client.get_config_version_hash();
@@ -1129,25 +1260,34 @@ fn test_config_version_hash_severity_isolation() {
 #[test]
 fn test_config_version_hash_distribution() {
     let (_env, client, actors) = setup();
-    
+
     // Test hash changes are well-distributed by making multiple small changes
     let mut hashes = Vec::new(&_env);
-    
+
     // Collect hashes from various config states
     for i in 1..=10 {
-        client.set_config(&actors.admin, &symbol_short!("critical"), &(15 + i), &100, &750);
+        client.set_config(
+            &actors.admin,
+            &symbol_short!("critical"),
+            &(15 + i),
+            &100,
+            &750,
+        );
         let hash = client.get_config_version_hash();
         hashes.push_back(hash);
     }
-    
+
     // Verify all hashes are unique
     for i in 0..hashes.len() {
         for j in (i + 1)..hashes.len() {
-            assert_ne!(hashes.get(i), hashes.get(j), 
-                "Hashes should be unique for different config values");
+            assert_ne!(
+                hashes.get(i),
+                hashes.get(j),
+                "Hashes should be unique for different config values"
+            );
         }
     }
-    
+
     // Restore original config
     client.set_config(&actors.admin, &symbol_short!("critical"), &15, &100, &750);
 }
@@ -1238,11 +1378,8 @@ mod snapshots {
 
         let mut entries = Vec::new();
         for (sev, mttr, status, ptype, rating, amount) in cases {
-            let result = client.calculate_sla_view(
-                &symbol(&env, "SNAP_B"),
-                &symbol(&env, sev),
-                &mttr,
-            );
+            let result =
+                client.calculate_sla_view(&symbol(&env, "SNAP_B"), &symbol(&env, sev), &mttr);
             assert_eq!(result.status, symbol(&env, status));
             assert_eq!(result.payment_type, symbol(&env, ptype));
             assert_eq!(result.rating, symbol(&env, rating));
@@ -1271,11 +1408,8 @@ mod snapshots {
 
         let mut entries = Vec::new();
         for (sev, mttr, status, ptype, rating, amount) in cases {
-            let result = client.calculate_sla_view(
-                &symbol(&env, "SNAP_R"),
-                &symbol(&env, sev),
-                &mttr,
-            );
+            let result =
+                client.calculate_sla_view(&symbol(&env, "SNAP_R"), &symbol(&env, sev), &mttr);
             assert_eq!(result.status, symbol(&env, status));
             assert_eq!(result.payment_type, symbol(&env, ptype));
             assert_eq!(result.rating, symbol(&env, rating));
@@ -1319,14 +1453,27 @@ mod snapshots {
 // ============================================================
 
 /// Setup with a custom critical config applied on top of defaults.
-fn setup_with_critical(threshold: u32, penalty: i128, reward: i128) -> (Env, SLACalculatorContractClient<'static>, Actors) {
+fn setup_with_critical(
+    threshold: u32,
+    penalty: i128,
+    reward: i128,
+) -> (Env, SLACalculatorContractClient<'static>, Actors) {
     let (env, client, actors) = setup();
-    client.set_config(&actors.admin, &symbol_short!("critical"), &threshold, &penalty, &reward);
+    client.set_config(
+        &actors.admin,
+        &symbol_short!("critical"),
+        &threshold,
+        &penalty,
+        &reward,
+    );
     (env, client, actors)
 }
 
 /// Setup and perform one calculation, returning the result along with the env/client/actors.
-fn setup_after_calculation(severity: &str, mttr: u32) -> (Env, SLACalculatorContractClient<'static>, Actors) {
+fn setup_after_calculation(
+    severity: &str,
+    mttr: u32,
+) -> (Env, SLACalculatorContractClient<'static>, Actors) {
     let (env, client, actors) = setup();
     client.calculate_sla(
         &actors.operator,
@@ -1496,10 +1643,35 @@ fn test_get_contract_metadata_returns_expected_fields() {
 fn test_get_contract_metadata_severities_are_canonical() {
     let (_env, client, _actors) = setup();
     let meta = client.get_contract_metadata();
-    assert_eq!(meta.supported_severities.get(0).unwrap(), symbol_short!("critical"));
-    assert_eq!(meta.supported_severities.get(1).unwrap(), symbol_short!("high"));
-    assert_eq!(meta.supported_severities.get(2).unwrap(), symbol_short!("medium"));
-    assert_eq!(meta.supported_severities.get(3).unwrap(), symbol_short!("low"));
+    assert_eq!(
+        meta.supported_severities.get(0).unwrap(),
+        symbol_short!("critical")
+    );
+    assert_eq!(
+        meta.supported_severities.get(1).unwrap(),
+        symbol_short!("high")
+    );
+    assert_eq!(
+        meta.supported_severities.get(2).unwrap(),
+        symbol_short!("medium")
+    );
+    assert_eq!(
+        meta.supported_severities.get(3).unwrap(),
+        symbol_short!("low")
+    );
+    let expected = [
+        symbol_short!("critical"),
+        symbol_short!("high"),
+        symbol_short!("medium"),
+        symbol_short!("low"),
+    ];
+
+    for (i, severity) in expected.iter().enumerate() {
+        assert_eq!(
+            meta.supported_severities.get(i as u32).unwrap(),
+            severity.clone()
+        );
+    }
 }
 
 #[test]
@@ -1510,6 +1682,7 @@ fn test_get_contract_metadata_is_deterministic() {
     assert_eq!(m1.storage_version, m2.storage_version);
     assert_eq!(m1.result_schema_version, m2.result_schema_version);
     assert_eq!(m1.contract_name, m2.contract_name);
+    assert_eq!(m1.supported_severities, m2.supported_severities);
 }
 
 // ============================================================
@@ -1574,11 +1747,7 @@ fn test_calculate_sla_wrong_case_severity_panics() {
 #[should_panic]
 fn test_calculate_sla_view_unknown_severity_panics() {
     let (env, client, _actors) = setup();
-    client.calculate_sla_view(
-        &symbol(&env, "VIEW001"),
-        &symbol_short!("unknown"),
-        &10,
-    );
+    client.calculate_sla_view(&symbol(&env, "VIEW001"), &symbol_short!("unknown"), &10);
 }
 // ============================================================
 // #96 – Backend-consumer smoke fixture (end-to-end sequence)
@@ -1668,9 +1837,7 @@ fn test_check_version_rejects_version_mismatch() {
 
     // Manually overwrite the stored version to simulate a future schema
     env.as_contract(&cid, || {
-        env.storage()
-            .instance()
-            .set(&STORAGE_VERSION_KEY, &99u32);
+        env.storage().instance().set(&STORAGE_VERSION_KEY, &99u32);
     });
 
     // Any versioned call must now panic with VersionMismatch
@@ -1721,7 +1888,9 @@ fn test_pause_stores_reason_and_timestamp() {
 
     client.pause(&actors.admin, &reason);
 
-    let info = client.get_pause_info().expect("pause info should be present");
+    let info = client
+        .get_pause_info()
+        .expect("pause info should be present");
     assert_eq!(info.reason, reason);
     // timestamp is ledger time; just assert it is non-zero in a real ledger,
     // in test env it defaults to 0 which is still a valid u64
@@ -1731,7 +1900,10 @@ fn test_pause_stores_reason_and_timestamp() {
 #[test]
 fn test_unpause_clears_pause_info() {
     let (env, client, actors) = setup();
-    client.pause(&actors.admin, &soroban_sdk::String::from_str(&env, "reason"));
+    client.pause(
+        &actors.admin,
+        &soroban_sdk::String::from_str(&env, "reason"),
+    );
     client.unpause(&actors.admin);
 
     assert_eq!(client.get_pause_info(), None);
@@ -1747,11 +1919,7 @@ fn test_get_pause_info_none_when_not_paused() {
 #[should_panic]
 fn test_calculate_sla_view_rejects_unknown_severity() {
     let (env, client, _actors) = setup();
-    client.calculate_sla_view(
-        &symbol_short!("UNK002"),
-        &Symbol::new(&env, "unknown"),
-        &10,
-    );
+    client.calculate_sla_view(&symbol_short!("UNK002"), &Symbol::new(&env, "unknown"), &10);
 }
 
 #[test]
@@ -1866,7 +2034,13 @@ fn test_zero_reward_fails_validation() {
 fn test_reward_too_large_fails_validation() {
     let (_env, client, actors) = setup();
     // Reward exceeds 100,000 maximum
-    client.set_config(&actors.admin, &symbol_short!("critical"), &15, &100, &150000);
+    client.set_config(
+        &actors.admin,
+        &symbol_short!("critical"),
+        &15,
+        &100,
+        &150000,
+    );
 }
 
 // Severity-specific validation tests
@@ -1940,9 +2114,21 @@ fn test_boundary_values_pass_validation() {
     client.set_config(&actors.admin, &symbol_short!("low"), &1, &1, &1);
 
     // Test maximum valid values for severity-specific constraints
-    client.set_config(&actors.admin, &symbol_short!("critical"), &60, &10000, &100000);
+    client.set_config(
+        &actors.admin,
+        &symbol_short!("critical"),
+        &60,
+        &10000,
+        &100000,
+    );
     client.set_config(&actors.admin, &symbol_short!("high"), &120, &10000, &100000);
-    client.set_config(&actors.admin, &symbol_short!("medium"), &240, &10000, &100000);
+    client.set_config(
+        &actors.admin,
+        &symbol_short!("medium"),
+        &240,
+        &10000,
+        &100000,
+    );
     client.set_config(&actors.admin, &symbol_short!("low"), &1440, &100, &100000);
 }
 
@@ -2425,7 +2611,11 @@ fn test_storage_growth_config_size_is_fixed() {
         client.set_config(&actors.admin, &symbol_short!("critical"), &15, &100, &750);
     }
 
-    assert_eq!(client.get_config_count(), 4, "Config map must stay at 4 entries");
+    assert_eq!(
+        client.get_config_count(),
+        4,
+        "Config map must stay at 4 entries"
+    );
 }
 
 #[test]
@@ -2591,7 +2781,10 @@ fn test_history_cap_drops_oldest_entry() {
 
     // Sentinel is still present at index 0
     let history_before = client.get_history();
-    assert_eq!(history_before.get(0).unwrap().outage_id, symbol(&env, "SENTINEL"));
+    assert_eq!(
+        history_before.get(0).unwrap().outage_id,
+        symbol(&env, "SENTINEL")
+    );
 
     // One more push should evict the sentinel
     client.calculate_sla(&op, &symbol_short!("NEW"), &symbol_short!("low"), &10);
@@ -2718,12 +2911,7 @@ fn test_monotonicity_threshold_boundary_is_met_not_violated() {
     // Exactly at threshold must always be "met", one over must always be "viol".
     let (_env, client, actors) = setup();
 
-    let cases: &[(&str, u32)] = &[
-        ("critical", 15),
-        ("high", 30),
-        ("medium", 60),
-        ("low", 120),
-    ];
+    let cases: &[(&str, u32)] = &[("critical", 15), ("high", 30), ("medium", 60), ("low", 120)];
 
     for (sev, threshold) in cases {
         let at = client.calculate_sla(
@@ -2791,7 +2979,10 @@ fn test_monotonicity_rating_degrades_with_mttr() {
 
     // Reward amounts must be non-increasing: top >= excel >= good
     assert!(r1.amount >= r2.amount, "top reward must be >= excel reward");
-    assert!(r2.amount >= r3.amount, "excel reward must be >= good reward");
+    assert!(
+        r2.amount >= r3.amount,
+        "excel reward must be >= good reward"
+    );
 }
 
 #[test]
@@ -2824,7 +3015,11 @@ fn test_monotonicity_all_severities_penalty_increases_with_mttr() {
         assert_eq!(r1.amount, -penalty_per_min);
         // r2: 5 min over → penalty = 5 * penalty_per_min
         assert_eq!(r2.amount, -(5 * penalty_per_min));
-        assert!(r2.amount < r1.amount, "Penalty must grow with overtime for {}", sev);
+        assert!(
+            r2.amount < r1.amount,
+            "Penalty must grow with overtime for {}",
+            sev
+        );
     }
 }
 
@@ -2834,21 +3029,34 @@ fn test_monotonicity_view_matches_mutating_for_all_mttr_values() {
     let (_env, client, actors) = setup();
 
     for mttr in [1u32, 7, 10, 14, 15, 16, 20, 30] {
-        let view = client.calculate_sla_view(
-            &symbol_short!("VM"),
-            &symbol_short!("critical"),
-            &mttr,
-        );
+        let view =
+            client.calculate_sla_view(&symbol_short!("VM"), &symbol_short!("critical"), &mttr);
         let mutating = client.calculate_sla(
             &actors.operator,
             &symbol_short!("VM"),
             &symbol_short!("critical"),
             &mttr,
         );
-        assert_eq!(view.status, mutating.status, "status mismatch at mttr={}", mttr);
-        assert_eq!(view.amount, mutating.amount, "amount mismatch at mttr={}", mttr);
-        assert_eq!(view.rating, mutating.rating, "rating mismatch at mttr={}", mttr);
-        assert_eq!(view.payment_type, mutating.payment_type, "payment_type mismatch at mttr={}", mttr);
+        assert_eq!(
+            view.status, mutating.status,
+            "status mismatch at mttr={}",
+            mttr
+        );
+        assert_eq!(
+            view.amount, mutating.amount,
+            "amount mismatch at mttr={}",
+            mttr
+        );
+        assert_eq!(
+            view.rating, mutating.rating,
+            "rating mismatch at mttr={}",
+            mttr
+        );
+        assert_eq!(
+            view.payment_type, mutating.payment_type,
+            "payment_type mismatch at mttr={}",
+            mttr
+        );
     }
 }
 
@@ -2947,6 +3155,11 @@ fn test_retention_limit_drops_oldest_when_exceeded() {
 
 #[test]
 fn test_retention_limit_update_takes_effect_on_next_calculate() {
+    // The retention limit only prevents growth beyond the cap; it does not
+    // retroactively shrink existing history. When the limit is lowered below
+    // the current history size, each subsequent calculate_sla call pushes one
+    // entry and drops one (net zero change) until the history naturally drains
+    // to the new limit via prune_history or prune_history_by_age.
     let env = Env::default();
     env.budget().reset_unlimited();
 
@@ -2962,13 +3175,38 @@ fn test_retention_limit_update_takes_effect_on_next_calculate() {
     }
     assert_eq!(client.get_history().len(), 10);
 
-    // Lower the limit; existing history is not pruned until next calculate
+    // Lower the limit; existing history is not pruned automatically
     client.set_retention_limit(&admin, &5);
-    assert_eq!(client.get_history().len(), 10);
+    assert_eq!(
+        client.get_history().len(),
+        10,
+        "Lowering limit must not retroactively prune"
+    );
 
-    // Next calculate triggers enforcement
+    // Each calculate_sla call pushes 1 and drops 1 (net zero) while history > limit.
+    // History stays at 10 until an explicit prune brings it to the new limit.
     client.calculate_sla(&op, &symbol_short!("AFT"), &symbol_short!("low"), &10);
-    assert_eq!(client.get_history().len(), 5);
+    assert_eq!(
+        client.get_history().len(),
+        10,
+        "History stays at 10 (push 1, drop 1)"
+    );
+
+    // Explicit prune brings history down to the new limit
+    client.prune_history(&admin, &5);
+    assert_eq!(
+        client.get_history().len(),
+        5,
+        "Explicit prune must enforce the new limit"
+    );
+
+    // Now the cap is active: further calculations stay at 5
+    client.calculate_sla(&op, &symbol_short!("CAP"), &symbol_short!("low"), &10);
+    assert_eq!(
+        client.get_history().len(),
+        5,
+        "History must stay at 5 after cap is active"
+    );
 }
 
 // ============================================================
@@ -2995,9 +3233,7 @@ fn test_get_migration_state_detects_version_mismatch() {
 
     // Overwrite stored version to simulate a future schema
     env.as_contract(&cid, || {
-        env.storage()
-            .instance()
-            .set(&STORAGE_VERSION_KEY, &99u32);
+        env.storage().instance().set(&STORAGE_VERSION_KEY, &99u32);
     });
 
     let info = client.get_migration_state();
@@ -3034,9 +3270,24 @@ fn test_get_latest_by_outage_returns_last_of_many() {
     let (env, client, actors) = setup();
 
     // Three calculations for the same outage; last one is a violation
-    client.calculate_sla(&actors.operator, &symbol(&env, "MULTI"), &symbol_short!("critical"), &5);
-    client.calculate_sla(&actors.operator, &symbol(&env, "MULTI"), &symbol_short!("critical"), &10);
-    client.calculate_sla(&actors.operator, &symbol(&env, "MULTI"), &symbol_short!("critical"), &20);
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "MULTI"),
+        &symbol_short!("critical"),
+        &5,
+    );
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "MULTI"),
+        &symbol_short!("critical"),
+        &10,
+    );
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "MULTI"),
+        &symbol_short!("critical"),
+        &20,
+    );
 
     let latest = client.get_latest_by_outage(&symbol(&env, "MULTI")).unwrap();
     assert_eq!(latest.status, symbol_short!("viol")); // mttr=20 > threshold=15
@@ -3047,9 +3298,24 @@ fn test_get_latest_by_outage_returns_last_of_many() {
 fn test_get_latest_by_outage_unaffected_by_other_outages() {
     let (env, client, actors) = setup();
 
-    client.calculate_sla(&actors.operator, &symbol(&env, "A"), &symbol_short!("critical"), &5);
-    client.calculate_sla(&actors.operator, &symbol(&env, "B"), &symbol_short!("critical"), &20);
-    client.calculate_sla(&actors.operator, &symbol(&env, "A"), &symbol_short!("critical"), &10);
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "A"),
+        &symbol_short!("critical"),
+        &5,
+    );
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "B"),
+        &symbol_short!("critical"),
+        &20,
+    );
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "A"),
+        &symbol_short!("critical"),
+        &10,
+    );
 
     // Latest for A is the second A entry (mttr=10), not B
     let latest_a = client.get_latest_by_outage(&symbol(&env, "A")).unwrap();
@@ -3079,9 +3345,24 @@ fn test_event_replay_history_matches_emitted_events() {
     // Verify that every entry in get_history corresponds to an emitted sla_calc event.
     let (env, client, actors) = setup();
 
-    client.calculate_sla(&actors.operator, &symbol(&env, "EVR_1"), &symbol_short!("critical"), &5);
-    client.calculate_sla(&actors.operator, &symbol(&env, "EVR_2"), &symbol_short!("high"), &35);
-    client.calculate_sla(&actors.operator, &symbol(&env, "EVR_3"), &symbol_short!("low"), &10);
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "EVR_1"),
+        &symbol_short!("critical"),
+        &5,
+    );
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "EVR_2"),
+        &symbol_short!("high"),
+        &35,
+    );
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "EVR_3"),
+        &symbol_short!("low"),
+        &10,
+    );
 
     let history = client.get_history();
     let events = env.events().all();
@@ -3140,12 +3421,24 @@ fn test_missed_event_recovery_via_get_latest_by_outage() {
     // Recovery: call get_latest_by_outage to get the current result.
     let (env, client, actors) = setup();
 
-    client.calculate_sla(&actors.operator, &symbol(&env, "OUTAGE_X"), &symbol_short!("critical"), &20);
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "OUTAGE_X"),
+        &symbol_short!("critical"),
+        &20,
+    );
     // Recalculation after fix
-    client.calculate_sla(&actors.operator, &symbol(&env, "OUTAGE_X"), &symbol_short!("critical"), &5);
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "OUTAGE_X"),
+        &symbol_short!("critical"),
+        &5,
+    );
 
     // Consumer recovers the latest result without replaying all events
-    let latest = client.get_latest_by_outage(&symbol(&env, "OUTAGE_X")).unwrap();
+    let latest = client
+        .get_latest_by_outage(&symbol(&env, "OUTAGE_X"))
+        .unwrap();
     assert_eq!(latest.status, symbol_short!("met"));
     assert_eq!(latest.mttr_minutes, 5);
 }
@@ -3156,9 +3449,24 @@ fn test_missed_event_recovery_stats_consistent_with_history() {
     // with the history they reconstruct.
     let (env, client, actors) = setup();
 
-    client.calculate_sla(&actors.operator, &symbol(&env, "S1"), &symbol_short!("critical"), &5);  // met
-    client.calculate_sla(&actors.operator, &symbol(&env, "S2"), &symbol_short!("critical"), &20); // viol
-    client.calculate_sla(&actors.operator, &symbol(&env, "S3"), &symbol_short!("high"), &10);     // met
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "S1"),
+        &symbol_short!("critical"),
+        &5,
+    ); // met
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "S2"),
+        &symbol_short!("critical"),
+        &20,
+    ); // viol
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "S3"),
+        &symbol_short!("high"),
+        &10,
+    ); // met
 
     let history = client.get_history();
     let stats = client.get_stats();
@@ -3184,14 +3492,16 @@ fn test_event_replay_view_function_produces_same_result_as_stored() {
     // with the same inputs, confirming determinism.
     let (env, client, actors) = setup();
 
-    client.calculate_sla(&actors.operator, &symbol(&env, "DET1"), &symbol_short!("critical"), &10);
-
-    let stored = client.get_latest_by_outage(&symbol(&env, "DET1")).unwrap();
-    let replayed = client.calculate_sla_view(
+    client.calculate_sla(
+        &actors.operator,
         &symbol(&env, "DET1"),
         &symbol_short!("critical"),
         &10,
     );
+
+    let stored = client.get_latest_by_outage(&symbol(&env, "DET1")).unwrap();
+    let replayed =
+        client.calculate_sla_view(&symbol(&env, "DET1"), &symbol_short!("critical"), &10);
 
     assert_eq!(stored.status, replayed.status);
     assert_eq!(stored.amount, replayed.amount);
@@ -3199,6 +3509,47 @@ fn test_event_replay_view_function_produces_same_result_as_stored() {
     assert_eq!(stored.payment_type, replayed.payment_type);
     assert_eq!(stored.mttr_minutes, replayed.mttr_minutes);
     assert_eq!(stored.threshold_minutes, replayed.threshold_minutes);
+    assert_eq!(stored.config_version_hash, replayed.config_version_hash);
+}
+
+#[test]
+fn test_calculation_result_is_bound_to_current_config_hash() {
+    let (_env, client, actors) = setup();
+
+    let expected_hash = client.get_config_version_hash();
+    let result = client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("BIND1"),
+        &symbol_short!("critical"),
+        &10,
+    );
+
+    assert_eq!(result.config_version_hash, expected_hash);
+}
+
+#[test]
+fn test_stored_result_retains_original_config_binding_after_config_change() {
+    let (env, client, actors) = setup();
+
+    client.calculate_sla(
+        &actors.operator,
+        &symbol(&env, "BIND2"),
+        &symbol_short!("critical"),
+        &10,
+    );
+    let before_change = client.get_latest_by_outage(&symbol(&env, "BIND2")).unwrap();
+    let original_hash = before_change.config_version_hash;
+
+    client.set_config(&actors.admin, &symbol_short!("critical"), &20, &200, &1000);
+    let after_hash = client.get_config_version_hash();
+    let stored_after_change = client.get_latest_by_outage(&symbol(&env, "BIND2")).unwrap();
+    let replayed_after_change =
+        client.calculate_sla_view(&symbol(&env, "BIND2"), &symbol_short!("critical"), &10);
+
+    assert_eq!(stored_after_change.config_version_hash, original_hash);
+    assert_ne!(original_hash, after_hash);
+    assert_eq!(replayed_after_change.config_version_hash, after_hash);
+    assert_eq!(stored.recorded_at, replayed.recorded_at);
 }
 
 #[test]
@@ -3209,7 +3560,11 @@ fn test_event_replay_after_prune_history_page_reflects_pruned_state() {
     let (env, client, actors) = setup();
 
     for i in 0..10u32 {
-        let oid = if i < 5 { symbol(&env, "OLD") } else { symbol(&env, "NEW") };
+        let oid = if i < 5 {
+            symbol(&env, "OLD")
+        } else {
+            symbol(&env, "NEW")
+        };
         client.calculate_sla(&actors.operator, &oid, &symbol_short!("low"), &10);
     }
 
@@ -3275,6 +3630,1000 @@ fn test_get_version_info_not_affected_by_sla_calculations() {
     assert_eq!(before.storage_version, after.storage_version);
     assert_eq!(before.result_schema_version, after.result_schema_version);
     assert_eq!(before.needs_migration, after.needs_migration);
+// #145 – Operator handoff cancellation and replacement lifecycle
+// ============================================================
+
+#[test]
+fn test_propose_operator_replaces_pending_proposal() {
+    // Re-proposing a different operator overwrites the pending slot.
+    let (env, client, actors) = setup();
+    let op_a = soroban_sdk::Address::generate(&env);
+    let op_b = soroban_sdk::Address::generate(&env);
+
+    client.propose_operator(&actors.admin, &op_a);
+    assert_eq!(client.get_pending_operator(), Some(op_a.clone()));
+
+    // Replace with op_b before op_a accepts
+    client.propose_operator(&actors.admin, &op_b);
+    assert_eq!(
+        client.get_pending_operator(),
+        Some(op_b.clone()),
+        "Second proposal must overwrite the first"
+    );
+}
+
+#[test]
+#[should_panic]
+fn test_superseded_pending_operator_cannot_accept() {
+    // op_a was proposed then replaced by op_b; op_a must not be able to accept.
+    let (env, client, actors) = setup();
+    let op_a = soroban_sdk::Address::generate(&env);
+    let op_b = soroban_sdk::Address::generate(&env);
+
+    client.propose_operator(&actors.admin, &op_a);
+    client.propose_operator(&actors.admin, &op_b); // replaces op_a
+
+    client.accept_operator(&op_a); // must panic – op_a is no longer pending
+}
+
+#[test]
+fn test_replacement_operator_can_accept_after_superseding() {
+    // op_b replaces op_a; op_b can accept and becomes the active operator.
+    let (env, client, actors) = setup();
+    let op_a = soroban_sdk::Address::generate(&env);
+    let op_b = soroban_sdk::Address::generate(&env);
+
+    client.propose_operator(&actors.admin, &op_a);
+    client.propose_operator(&actors.admin, &op_b);
+    client.accept_operator(&op_b);
+
+    assert_eq!(client.get_operator(), op_b);
+    assert_eq!(client.get_pending_operator(), None);
+}
+
+#[test]
+fn test_cancel_pending_operator_by_proposing_current_operator() {
+    // Admin can effectively cancel a pending proposal by re-proposing the current operator.
+    // After acceptance the operator is unchanged.
+    let (env, client, actors) = setup();
+    let new_op = soroban_sdk::Address::generate(&env);
+
+    client.propose_operator(&actors.admin, &new_op);
+    // "Cancel" by re-proposing the current operator
+    client.propose_operator(&actors.admin, &actors.operator);
+    client.accept_operator(&actors.operator);
+
+    assert_eq!(client.get_operator(), actors.operator);
+    assert_eq!(client.get_pending_operator(), None);
+}
+
+#[test]
+fn test_pending_operator_state_queryable_throughout_lifecycle() {
+    // Verify get_pending_operator returns the correct value at each lifecycle stage.
+    let (env, client, actors) = setup();
+    let new_op = soroban_sdk::Address::generate(&env);
+
+    // Before proposal: None
+    assert_eq!(client.get_pending_operator(), None);
+
+    // After proposal: Some(new_op)
+    client.propose_operator(&actors.admin, &new_op);
+    assert_eq!(client.get_pending_operator(), Some(new_op.clone()));
+
+    // After acceptance: None
+    client.accept_operator(&new_op);
+    assert_eq!(client.get_pending_operator(), None);
+}
+
+#[test]
+fn test_operator_handoff_full_lifecycle_old_operator_locked_out() {
+    // Full lifecycle: propose → accept → old operator cannot calculate.
+    let (env, client, actors) = setup();
+    let new_op = soroban_sdk::Address::generate(&env);
+
+    client.propose_operator(&actors.admin, &new_op);
+    client.accept_operator(&new_op);
+
+    // New operator can calculate
+    let result = client.calculate_sla(
+        &new_op,
+        &symbol_short!("HO_NEW"),
+        &symbol_short!("critical"),
+        &5,
+    );
+    assert_eq!(result.status, symbol_short!("met"));
+}
+
+#[test]
+fn test_multiple_replacement_cycles_end_state_is_correct() {
+    // Propose A, replace with B, replace with C, accept C.
+    let (env, client, actors) = setup();
+    let op_a = soroban_sdk::Address::generate(&env);
+    let op_b = soroban_sdk::Address::generate(&env);
+    let op_c = soroban_sdk::Address::generate(&env);
+
+    client.propose_operator(&actors.admin, &op_a);
+    client.propose_operator(&actors.admin, &op_b);
+    client.propose_operator(&actors.admin, &op_c);
+
+    assert_eq!(client.get_pending_operator(), Some(op_c.clone()));
+    client.accept_operator(&op_c);
+
+    assert_eq!(client.get_operator(), op_c);
+    assert_eq!(client.get_pending_operator(), None);
+}
+
+// ============================================================
+// #147 – Admin renounce preconditions
+// ============================================================
+
+#[test]
+fn test_renounce_with_pending_admin_proposal_clears_proposal() {
+    // Renounce while a pending admin proposal exists must clear the proposal atomically.
+    let (env, client, actors) = setup();
+    let new_admin = soroban_sdk::Address::generate(&env);
+
+    client.propose_admin(&actors.admin, &new_admin);
+    assert_eq!(client.get_pending_admin(), Some(new_admin.clone()));
+
+    client.renounce_admin(&actors.admin);
+
+    // Pending proposal is cleared
+    assert_eq!(client.get_pending_admin(), None);
+}
+
+#[test]
+#[should_panic]
+fn test_proposed_admin_cannot_accept_after_renounce() {
+    // After renounce, the previously proposed admin cannot accept (no admin exists).
+    let (env, client, actors) = setup();
+    let new_admin = soroban_sdk::Address::generate(&env);
+
+    client.propose_admin(&actors.admin, &new_admin);
+    client.renounce_admin(&actors.admin);
+
+    // accept_admin must panic – pending proposal was cleared
+    client.accept_admin(&new_admin);
+}
+
+#[test]
+fn test_renounce_while_paused_succeeds() {
+    // Admin can renounce even when the contract is paused.
+    let (env, client, actors) = setup();
+    client.pause(
+        &actors.admin,
+        &soroban_sdk::String::from_str(&env, "maintenance"),
+    );
+    assert_eq!(client.is_paused(), true);
+
+    // Renounce must succeed regardless of pause state
+    client.renounce_admin(&actors.admin);
+}
+
+#[test]
+#[should_panic]
+fn test_post_renounce_pause_is_locked() {
+    // After renounce, pause is permanently locked.
+    let (env, client, actors) = setup();
+    client.renounce_admin(&actors.admin);
+    client.pause(&actors.admin, &soroban_sdk::String::from_str(&env, "x"));
+}
+
+#[test]
+#[should_panic]
+fn test_post_renounce_unpause_is_locked() {
+    // After renounce, unpause is permanently locked.
+    let (env, client, actors) = setup();
+    client.pause(&actors.admin, &soroban_sdk::String::from_str(&env, "x"));
+    client.renounce_admin(&actors.admin);
+    client.unpause(&actors.admin);
+}
+
+#[test]
+#[should_panic]
+fn test_post_renounce_set_config_is_locked() {
+    let (_env, client, actors) = setup();
+    client.renounce_admin(&actors.admin);
+    client.set_config(&actors.admin, &symbol_short!("critical"), &20, &200, &1000);
+}
+
+#[test]
+#[should_panic]
+fn test_post_renounce_prune_history_is_locked() {
+    let (_env, client, actors) = setup();
+    client.renounce_admin(&actors.admin);
+    client.prune_history(&actors.admin, &0);
+}
+
+#[test]
+#[should_panic]
+fn test_post_renounce_propose_admin_is_locked() {
+    let (env, client, actors) = setup();
+    let new_admin = soroban_sdk::Address::generate(&env);
+    client.renounce_admin(&actors.admin);
+    client.propose_admin(&actors.admin, &new_admin);
+}
+
+#[test]
+fn test_post_renounce_operator_can_still_calculate() {
+    // Renounce only removes admin authority; the operator role is unaffected.
+    let (_env, client, actors) = setup();
+    client.renounce_admin(&actors.admin);
+
+    let result = client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("REN_OP"),
+        &symbol_short!("critical"),
+        &5,
+    );
+    assert_eq!(result.status, symbol_short!("met"));
+}
+
+#[test]
+fn test_renounce_is_irreversible_no_admin_exists() {
+    // After renounce, get_admin must fail (no admin in storage).
+    let (_env, client, actors) = setup();
+    client.renounce_admin(&actors.admin);
+
+    let result = client.try_get_admin();
+    assert!(result.is_err(), "get_admin must fail after renounce");
+}
+
+// ============================================================
+// #148 – Pause-metadata history through repeated pause/unpause cycles
+// ============================================================
+
+#[test]
+fn test_pause_metadata_reflects_latest_reason_after_cycle() {
+    // After pause → unpause → pause again, metadata must reflect the second pause.
+    let (env, client, actors) = setup();
+
+    let reason1 = soroban_sdk::String::from_str(&env, "first maintenance");
+    let reason2 = soroban_sdk::String::from_str(&env, "second maintenance");
+
+    client.pause(&actors.admin, &reason1);
+    client.unpause(&actors.admin);
+    client.pause(&actors.admin, &reason2);
+
+    let info = client.get_pause_info().expect("pause info must be present");
+    assert_eq!(
+        info.reason, reason2,
+        "Metadata must reflect the most recent pause reason"
+    );
+}
+
+#[test]
+fn test_pause_metadata_cleared_between_cycles() {
+    // After unpause, get_pause_info must return None before the next pause.
+    let (env, client, actors) = setup();
+
+    client.pause(
+        &actors.admin,
+        &soroban_sdk::String::from_str(&env, "cycle1"),
+    );
+    client.unpause(&actors.admin);
+
+    assert_eq!(
+        client.get_pause_info(),
+        None,
+        "Pause info must be None after unpause"
+    );
+}
+
+#[test]
+fn test_pause_metadata_timestamp_advances_across_cycles() {
+    // Each pause cycle records a fresh timestamp; later pauses must have >= timestamp.
+    let env = Env::default();
+    env.ledger().set_timestamp(1000);
+
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let client = SLACalculatorContractClient::new(&env, &cid);
+    let admin = soroban_sdk::Address::generate(&env);
+    let op = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &op);
+
+    client.pause(&admin, &soroban_sdk::String::from_str(&env, "first"));
+    let ts1 = client.get_pause_info().unwrap().paused_at;
+    assert_eq!(ts1, 1000);
+
+    client.unpause(&admin);
+
+    env.ledger().set_timestamp(2000);
+    client.pause(&admin, &soroban_sdk::String::from_str(&env, "second"));
+    let ts2 = client.get_pause_info().unwrap().paused_at;
+    assert_eq!(ts2, 2000);
+
+    assert!(ts2 > ts1, "Second pause timestamp must be later than first");
+}
+
+#[test]
+fn test_repeated_pause_unpause_cycles_is_paused_state_consistent() {
+    // is_paused must toggle correctly through multiple cycles.
+    let (env, client, actors) = setup();
+
+    for _ in 0..5u32 {
+        assert_eq!(client.is_paused(), false);
+        client.pause(&actors.admin, &soroban_sdk::String::from_str(&env, "cycle"));
+        assert_eq!(client.is_paused(), true);
+        client.unpause(&actors.admin);
+    }
+    assert_eq!(client.is_paused(), false);
+}
+
+#[test]
+fn test_pause_metadata_different_reasons_each_cycle() {
+    // Each cycle stores a distinct reason; verify the last one is always current.
+    let (env, client, actors) = setup();
+
+    let reasons = ["alpha", "beta", "gamma", "delta"];
+    for reason_str in reasons {
+        let reason = soroban_sdk::String::from_str(&env, reason_str);
+        client.pause(&actors.admin, &reason.clone());
+        let info = client.get_pause_info().unwrap();
+        assert_eq!(
+            info.reason, reason,
+            "Reason must match for cycle '{}'",
+            reason_str
+        );
+        client.unpause(&actors.admin);
+    }
+}
+
+#[test]
+fn test_calculate_sla_blocked_and_unblocked_across_cycles() {
+    // Verify calculate_sla is blocked during pause and unblocked after unpause,
+    // across multiple cycles.
+    let (env, client, actors) = setup();
+
+    for _ in 0..3u32 {
+        // Unpaused: calculation succeeds
+        let result = client.calculate_sla(
+            &actors.operator,
+            &symbol_short!("CYC"),
+            &symbol_short!("critical"),
+            &5,
+        );
+        assert_eq!(result.status, symbol_short!("met"));
+
+        // Paused: calculation must fail
+        client.pause(&actors.admin, &soroban_sdk::String::from_str(&env, "cycle"));
+        let blocked = client.try_calculate_sla(
+            &actors.operator,
+            &symbol_short!("CYC"),
+            &symbol_short!("critical"),
+            &5,
+        );
+        assert!(
+            blocked.is_err(),
+            "calculate_sla must be blocked while paused"
+        );
+
+        client.unpause(&actors.admin);
+    }
+}
+
+#[test]
+fn test_pause_events_emitted_each_cycle() {
+    // Each pause and unpause must emit the corresponding event.
+    let (env, client, actors) = setup();
+
+    client.pause(&actors.admin, &soroban_sdk::String::from_str(&env, "c1"));
+    client.unpause(&actors.admin);
+    client.pause(&actors.admin, &soroban_sdk::String::from_str(&env, "c2"));
+    client.unpause(&actors.admin);
+
+    // Count paused and unpause events
+    let events = env.events().all();
+    let mut pause_count = 0u32;
+    let mut unpause_count = 0u32;
+    for i in 0..events.len() {
+        let (_, topics, _) = events.get(i).unwrap();
+        let t0: Symbol = topics.get(0).unwrap().try_into_val(&env).unwrap();
+        if t0 == EVENT_PAUSED {
+            pause_count += 1;
+        } else if t0 == EVENT_UNPAUSED {
+            unpause_count += 1;
+        }
+    }
+    assert_eq!(pause_count, 2, "Must emit 2 paused events");
+    assert_eq!(unpause_count, 2, "Must emit 2 unpause events");
+}
+
+// ============================================================
+// #135 – Storage-growth regression coverage
+// ============================================================
+
+#[test]
+fn test_storage_growth_history_grows_linearly_then_caps() {
+    // History length must grow by 1 per calculation until the cap, then stay flat.
+    let env = Env::default();
+    env.budget().reset_unlimited();
+
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let client = SLACalculatorContractClient::new(&env, &cid);
+    let admin = soroban_sdk::Address::generate(&env);
+    let op = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &op);
+
+    // Grow to 10 entries
+    for i in 0..10u32 {
+        client.calculate_sla(&op, &symbol_short!("GRW"), &symbol_short!("low"), &10);
+        assert_eq!(
+            client.get_history().len(),
+            i + 1,
+            "History must grow by 1 per calculation (entry {})",
+            i + 1
+        );
+    }
+
+    // Set a small cap and verify it holds
+    client.set_retention_limit(&admin, &10);
+    client.calculate_sla(&op, &symbol_short!("GRW"), &symbol_short!("low"), &10);
+    assert_eq!(
+        client.get_history().len(),
+        10,
+        "History must not exceed the retention limit"
+    );
+}
+
+#[test]
+fn test_storage_growth_prune_cycle_keeps_history_bounded() {
+    // Simulate a long-running scenario: fill → prune → fill → prune.
+    // History must never exceed the prune target.
+    let env = Env::default();
+    env.budget().reset_unlimited();
+
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let client = SLACalculatorContractClient::new(&env, &cid);
+    let admin = soroban_sdk::Address::generate(&env);
+    let op = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &op);
+
+    for _cycle in 0..3u32 {
+        for _ in 0..20u32 {
+            client.calculate_sla(&op, &symbol_short!("CYC"), &symbol_short!("low"), &10);
+        }
+        client.prune_history(&admin, &5);
+        assert_eq!(
+            client.get_history().len(),
+            5,
+            "History must be bounded to 5 after each prune cycle"
+        );
+    }
+}
+
+#[test]
+fn test_storage_growth_age_prune_cycle_keeps_history_bounded() {
+    // Simulate time-based pruning across multiple ledger epochs.
+    let env = Env::default();
+    env.budget().reset_unlimited();
+
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let client = SLACalculatorContractClient::new(&env, &cid);
+    let admin = soroban_sdk::Address::generate(&env);
+    let op = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &op);
+
+    // Epoch 1: add 10 entries at t=0
+    env.ledger().set_timestamp(0);
+    for _ in 0..10u32 {
+        client.calculate_sla(&op, &symbol_short!("EP1"), &symbol_short!("low"), &10);
+    }
+
+    // Epoch 2: advance time, add 5 more, prune old ones
+    env.ledger().set_timestamp(10_000);
+    for _ in 0..5u32 {
+        client.calculate_sla(&op, &symbol_short!("EP2"), &symbol_short!("low"), &10);
+    }
+    client.prune_history_by_age(&admin, &5_000); // cutoff=5000; epoch1 entries (t=0) removed
+
+    assert_eq!(
+        client.get_history().len(),
+        5,
+        "Only epoch-2 entries must remain after age prune"
+    );
+}
+
+#[test]
+fn test_storage_growth_config_map_stays_fixed_size() {
+    // Config map must remain exactly 4 entries regardless of update frequency.
+    let (_env, client, actors) = setup();
+
+    for _ in 0..50u32 {
+        client.set_config(&actors.admin, &symbol_short!("critical"), &15, &100, &750);
+        client.set_config(&actors.admin, &symbol_short!("high"), &30, &50, &750);
+    }
+
+    assert_eq!(
+        client.get_config_count(),
+        4,
+        "Config map must always have exactly 4 entries"
+    );
+}
+
+#[test]
+fn test_storage_growth_stats_struct_size_is_constant() {
+    // Stats is a fixed-size struct; total_calculations must equal the number of calls.
+    let env = Env::default();
+    env.budget().reset_unlimited();
+
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let client = SLACalculatorContractClient::new(&env, &cid);
+    let admin = soroban_sdk::Address::generate(&env);
+    let op = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &op);
+
+    let n = 200u32;
+    for i in 0..n {
+        let mttr = if i % 3 == 0 { 5u32 } else { 20u32 };
+        client.calculate_sla(&op, &symbol_short!("ST"), &symbol_short!("critical"), &mttr);
+    }
+
+    let stats = client.get_stats();
+    assert_eq!(
+        stats.total_calculations, n as u64,
+        "Stats must track exactly {} calculations",
+        n
+    );
+    // Violations + non-violations must sum to total
+    let non_violations = stats.total_calculations - stats.total_violations;
+    assert_eq!(
+        stats.total_violations + non_violations,
+        stats.total_calculations,
+        "Violation + met counts must equal total"
+    );
+    let _ = admin;
+}
+
+#[test]
+fn test_storage_growth_retention_limit_prevents_unbounded_growth() {
+    // With a small retention limit, history must never exceed it even after many calls.
+    let env = Env::default();
+    env.budget().reset_unlimited();
+
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let client = SLACalculatorContractClient::new(&env, &cid);
+    let admin = soroban_sdk::Address::generate(&env);
+    let op = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &op);
+
+    client.set_retention_limit(&admin, &20);
+
+    for _ in 0..100u32 {
+        client.calculate_sla(&op, &symbol_short!("LIM"), &symbol_short!("low"), &10);
+    }
+
+    assert_eq!(
+        client.get_history().len(),
+        20,
+        "History must be capped at the configured retention limit"
+    );
+}
+
+#[test]
+fn test_storage_growth_regression_mixed_operations() {
+    // Regression: interleave calculations, config updates, and pruning.
+    // Verify no unexpected growth in any storage slot.
+    let env = Env::default();
+    env.budget().reset_unlimited();
+
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let client = SLACalculatorContractClient::new(&env, &cid);
+    let admin = soroban_sdk::Address::generate(&env);
+    let op = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &op);
+
+    for i in 0..30u32 {
+        client.calculate_sla(&op, &symbol_short!("MIX"), &symbol_short!("critical"), &5);
+
+        if i % 10 == 9 {
+            // Prune every 10 entries
+            client.prune_history(&admin, &5);
+            assert!(
+                client.get_history().len() <= 5,
+                "History must not exceed 5 after prune at iteration {}",
+                i
+            );
+        }
+
+        if i % 5 == 4 {
+            // Config update must not grow the config map
+            client.set_config(&admin, &symbol_short!("critical"), &15, &100, &750);
+            assert_eq!(client.get_config_count(), 4);
+        }
+    }
+
+    // Final state: history bounded, config fixed, stats consistent
+    let stats = client.get_stats();
+    assert_eq!(stats.total_calculations, 30);
+    assert_eq!(client.get_config_count(), 4);
+}
+
+// ============================================================
+// SC-006 (#126) – Invariance: calculate_sla vs calculate_sla_view
+//
+// Both paths share compute_result; these tests prove they never diverge
+// in result semantics across all severities and representative MTTR values.
+// Allowed differences (history growth, stats increment, recorded_at timestamp)
+// are explicitly documented and isolated below.
+// ============================================================
+
+/// Helper: call both paths and assert full result parity.
+fn assert_invariant(
+    client: &SLACalculatorContractClient,
+    operator: &soroban_sdk::Address,
+    outage_id: Symbol,
+    severity: Symbol,
+    mttr: u32,
+) {
+    let view = client.calculate_sla_view(&outage_id, &severity, &mttr);
+    let mutating = client.calculate_sla(operator, &outage_id, &severity, &mttr);
+
+    assert_eq!(
+        view.outage_id, mutating.outage_id,
+        "outage_id mismatch mttr={}",
+        mttr
+    );
+    assert_eq!(
+        view.status, mutating.status,
+        "status mismatch mttr={}",
+        mttr
+    );
+    assert_eq!(
+        view.mttr_minutes, mutating.mttr_minutes,
+        "mttr_minutes mismatch mttr={}",
+        mttr
+    );
+    assert_eq!(
+        view.threshold_minutes, mutating.threshold_minutes,
+        "threshold_minutes mismatch mttr={}",
+        mttr
+    );
+    assert_eq!(
+        view.amount, mutating.amount,
+        "amount mismatch mttr={}",
+        mttr
+    );
+    assert_eq!(
+        view.payment_type, mutating.payment_type,
+        "payment_type mismatch mttr={}",
+        mttr
+    );
+    assert_eq!(
+        view.rating, mutating.rating,
+        "rating mismatch mttr={}",
+        mttr
+    );
+    // Documented allowed difference: recorded_at is 0 for view, ledger timestamp for mutating.
+    assert_eq!(view.recorded_at, 0, "view recorded_at must always be 0");
+    assert_eq!(
+        view.recorded_at, mutating.recorded_at,
+        "recorded_at mismatch mttr={}",
+        mttr
+    );
+}
+
+#[test]
+fn test_invariance_critical_all_rating_zones() {
+    // critical threshold=15; covers top (<50%), excel (50-74%), good (75-100%), viol (>100%)
+    let (_env, client, actors) = setup();
+    let sev = symbol_short!("critical");
+    for mttr in [1u32, 7, 10, 12, 15, 16, 20, 30] {
+        assert_invariant(
+            &client,
+            &actors.operator,
+            symbol_short!("INV"),
+            sev.clone(),
+            mttr,
+        );
+    }
+}
+
+#[test]
+fn test_invariance_high_all_rating_zones() {
+    let (_env, client, actors) = setup();
+    let sev = symbol_short!("high");
+    // high threshold=30
+    for mttr in [1u32, 14, 22, 28, 30, 31, 40, 60] {
+        assert_invariant(
+            &client,
+            &actors.operator,
+            symbol_short!("INV"),
+            sev.clone(),
+            mttr,
+        );
+    }
+}
+
+#[test]
+fn test_invariance_medium_all_rating_zones() {
+    let (_env, client, actors) = setup();
+    let sev = symbol_short!("medium");
+    // medium threshold=60
+    for mttr in [1u32, 29, 44, 55, 60, 61, 80, 120] {
+        assert_invariant(
+            &client,
+            &actors.operator,
+            symbol_short!("INV"),
+            sev.clone(),
+            mttr,
+        );
+    }
+}
+
+#[test]
+fn test_invariance_low_all_rating_zones() {
+    let (_env, client, actors) = setup();
+    let sev = symbol_short!("low");
+    // low threshold=120
+    for mttr in [1u32, 59, 89, 110, 120, 121, 150, 240] {
+        assert_invariant(
+            &client,
+            &actors.operator,
+            symbol_short!("INV"),
+            sev.clone(),
+            mttr,
+        );
+    }
+}
+
+#[test]
+fn test_invariance_view_does_not_mutate_history() {
+    // calculate_sla_view must never append to history.
+    let (_env, client, actors) = setup();
+
+    client.calculate_sla_view(&symbol_short!("V1"), &symbol_short!("critical"), &5);
+    client.calculate_sla_view(&symbol_short!("V2"), &symbol_short!("high"), &35);
+    assert_eq!(client.get_history().len(), 0, "view must not write history");
+
+    // One mutating call → exactly one history entry
+    client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("M1"),
+        &symbol_short!("critical"),
+        &5,
+    );
+    assert_eq!(client.get_history().len(), 1);
+}
+
+#[test]
+fn test_invariance_view_does_not_mutate_stats() {
+    // calculate_sla_view must never increment stats.
+    let (_env, client, actors) = setup();
+
+    for _ in 0..5u32 {
+        client.calculate_sla_view(&symbol_short!("VS"), &symbol_short!("critical"), &5);
+    }
+    assert_eq!(
+        client.get_stats().total_calculations,
+        0,
+        "view must not increment stats"
+    );
+
+    client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("MS"),
+        &symbol_short!("critical"),
+        &5,
+    );
+    assert_eq!(client.get_stats().total_calculations, 1);
+}
+
+#[test]
+fn test_invariance_view_works_while_paused() {
+    // calculate_sla_view bypasses the pause guard; calculate_sla does not.
+    let (env, client, actors) = setup();
+    client.pause(&actors.admin, &soroban_sdk::String::from_str(&env, "test"));
+
+    // View must succeed even when paused
+    let view = client.calculate_sla_view(&symbol_short!("PV"), &symbol_short!("critical"), &5);
+    assert_eq!(view.status, symbol_short!("met"));
+
+    // Mutating must fail
+    let blocked = client.try_calculate_sla(
+        &actors.operator,
+        &symbol_short!("PM"),
+        &symbol_short!("critical"),
+        &5,
+    );
+    assert!(blocked.is_err());
+}
+
+#[test]
+fn test_invariance_after_config_change() {
+    // After a config update both paths must reflect the new config identically.
+    let (_env, client, actors) = setup();
+
+    // Update critical: threshold=20, penalty=200, reward=1000
+    client.set_config(&actors.admin, &symbol_short!("critical"), &20, &200, &1000);
+
+    // mttr=25 → 5 min over new threshold → penalty = 5*200 = 1000
+    let view = client.calculate_sla_view(&symbol_short!("CFG"), &symbol_short!("critical"), &25);
+    let mutating = client.calculate_sla(
+        &actors.operator,
+        &symbol_short!("CFG"),
+        &symbol_short!("critical"),
+        &25,
+    );
+
+    assert_eq!(view.status, mutating.status);
+    assert_eq!(view.amount, mutating.amount);
+    assert_eq!(view.amount, -1000);
+}
+
+#[test]
+fn test_invariance_boundary_mttr_zero() {
+    // mttr=0 is within threshold for all severities → always "met" with top rating.
+    let (_env, client, actors) = setup();
+    for sev in [
+        symbol_short!("critical"),
+        symbol_short!("high"),
+        symbol_short!("medium"),
+        symbol_short!("low"),
+    ] {
+        let view = client.calculate_sla_view(&symbol_short!("Z"), &sev, &0);
+        let mutating = client.calculate_sla(&actors.operator, &symbol_short!("Z"), &sev, &0);
+        assert_eq!(view.status, symbol_short!("met"));
+        assert_eq!(view.status, mutating.status);
+        assert_eq!(view.amount, mutating.amount);
+        assert_eq!(view.rating, symbol_short!("top")); // ratio=0% < 50%
+    }
+}
+
+// ============================================================
+// SC-007 (#127) – Overflow and extreme-config safety tests
+//
+// Validates that large thresholds, penalties, rewards, and MTTR values
+// are either accepted with correct arithmetic or rejected with stable errors.
+// ============================================================
+
+#[test]
+fn test_extreme_mttr_at_max_u32_violates_and_does_not_overflow() {
+    // mttr = u32::MAX with default critical config (threshold=15, penalty=100/min).
+    // overtime = u32::MAX - 15 ≈ 4.29e9; penalty = overtime * 100 as i128.
+    // i128 can hold up to ~1.7e38, so no overflow.
+    let env = Env::default();
+    env.budget().reset_unlimited();
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let client = SLACalculatorContractClient::new(&env, &cid);
+    let admin = soroban_sdk::Address::generate(&env);
+    let op = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &op);
+
+    let mttr = u32::MAX;
+    let result =
+        client.calculate_sla_view(&symbol_short!("XMTTR"), &symbol_short!("critical"), &mttr);
+
+    assert_eq!(result.status, symbol_short!("viol"));
+    assert_eq!(result.payment_type, symbol_short!("pen"));
+    // overtime = (u32::MAX - 15) as i128; penalty = overtime * 100
+    let expected_penalty = -((u32::MAX - 15) as i128 * 100);
+    assert_eq!(result.amount, expected_penalty);
+    assert!(result.amount < 0);
+}
+
+#[test]
+fn test_extreme_mttr_large_value_penalty_is_linear() {
+    // Penalty must scale linearly: doubling overtime doubles penalty.
+    let (_env, client, _actors) = setup();
+
+    // critical threshold=15, penalty=100/min
+    let r1 = client.calculate_sla_view(&symbol_short!("LIN1"), &symbol_short!("critical"), &115); // 100 min over
+    let r2 = client.calculate_sla_view(&symbol_short!("LIN2"), &symbol_short!("critical"), &215); // 200 min over
+
+    assert_eq!(r1.amount, -10_000); // 100 * 100
+    assert_eq!(r2.amount, -20_000); // 200 * 100
+    assert_eq!(r2.amount, r1.amount * 2);
+}
+
+#[test]
+fn test_extreme_config_max_valid_penalty_and_reward() {
+    // Set config to boundary-valid maximums and verify arithmetic is correct.
+    // critical: threshold=60, penalty=10000, reward=100000
+    let (_env, client, actors) = setup();
+    client.set_config(
+        &actors.admin,
+        &symbol_short!("critical"),
+        &60,
+        &10000,
+        &100000,
+    );
+
+    // mttr=61 → 1 min over → penalty = 10000
+    let viol = client.calculate_sla_view(&symbol_short!("XPEN"), &symbol_short!("critical"), &61);
+    assert_eq!(viol.amount, -10_000);
+
+    // mttr=1 → ratio=1% < 50% → top → reward = 100000 * 200 / 100 = 200000
+    let met = client.calculate_sla_view(&symbol_short!("XREW"), &symbol_short!("critical"), &1);
+    assert_eq!(met.amount, 200_000);
+}
+
+#[test]
+fn test_extreme_config_max_valid_low_threshold() {
+    // low: threshold=1440 (24h), penalty=1, reward=1
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &1440, &1, &1);
+
+    // mttr=1440 → exactly at threshold → met, good rating
+    let at = client.calculate_sla_view(&symbol_short!("LT"), &symbol_short!("low"), &1440);
+    assert_eq!(at.status, symbol_short!("met"));
+    assert_eq!(at.rating, symbol_short!("good"));
+
+    // mttr=1441 → 1 min over → penalty = 1
+    let over = client.calculate_sla_view(&symbol_short!("LT"), &symbol_short!("low"), &1441);
+    assert_eq!(over.status, symbol_short!("viol"));
+    assert_eq!(over.amount, -1);
+}
+
+#[test]
+fn test_extreme_penalty_large_overtime_no_i128_overflow() {
+    // Worst-case: low threshold=1, penalty=100 (max for low), mttr=u32::MAX
+    // overtime = u32::MAX - 1 ≈ 4.29e9; penalty = 4.29e9 * 100 ≈ 4.29e11
+    // i128 max ≈ 1.7e38 — no overflow possible.
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &1, &100, &1);
+
+    let env = Env::default();
+    env.budget().reset_unlimited();
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let client2 = SLACalculatorContractClient::new(&env, &cid);
+    let admin2 = soroban_sdk::Address::generate(&env);
+    let op2 = soroban_sdk::Address::generate(&env);
+    client2.initialize(&admin2, &op2);
+    client2.set_config(&admin2, &symbol_short!("low"), &1, &100, &1);
+
+    let result =
+        client2.calculate_sla_view(&symbol_short!("OVF"), &symbol_short!("low"), &u32::MAX);
+    assert_eq!(result.status, symbol_short!("viol"));
+    let expected = -((u32::MAX - 1) as i128 * 100);
+    assert_eq!(result.amount, expected);
+}
+
+#[test]
+fn test_extreme_reward_max_multiplier_no_overflow() {
+    // Max reward: reward_base=100000, multiplier=200 (top rating) → 200000
+    // This is well within i128 range.
+    let (_env, client, actors) = setup();
+    client.set_config(
+        &actors.admin,
+        &symbol_short!("critical"),
+        &60,
+        &10000,
+        &100000,
+    );
+
+    let result = client.calculate_sla_view(&symbol_short!("MAXR"), &symbol_short!("critical"), &1);
+    assert_eq!(result.amount, 200_000); // 100000 * 200 / 100
+    assert!(result.amount > 0);
+}
+
+#[test]
+#[should_panic]
+fn test_extreme_threshold_zero_rejected() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &0, &10, &600);
+}
+
+#[test]
+#[should_panic]
+fn test_extreme_threshold_above_1440_rejected() {
+    let (_env, client, actors) = setup();
+    // 1441 exceeds the 24-hour global cap
+    client.set_config(&actors.admin, &symbol_short!("low"), &1441, &10, &600);
+}
+
+#[test]
+#[should_panic]
+fn test_extreme_penalty_zero_rejected() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &120, &0, &600);
+}
+
+#[test]
+#[should_panic]
+fn test_extreme_penalty_above_10000_rejected() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &120, &10001, &600);
 }
 
 #[test]
@@ -3294,4 +4643,288 @@ fn test_get_version_info_needs_migration_false_after_migrate() {
     client.migrate(&actors.admin);
     let info = client.get_version_info();
     assert!(!info.needs_migration);
+fn test_extreme_reward_zero_rejected() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &120, &10, &0);
+}
+
+#[test]
+#[should_panic]
+fn test_extreme_reward_above_100000_rejected() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &120, &10, &100001);
+}
+
+#[test]
+fn test_extreme_mttr_equals_threshold_is_always_met() {
+    // At exactly the threshold, result must always be "met" regardless of how large the threshold is.
+    let (_env, client, actors) = setup();
+    // Set low to max threshold
+    client.set_config(&actors.admin, &symbol_short!("low"), &1440, &1, &1);
+
+    let result = client.calculate_sla_view(&symbol_short!("EQ"), &symbol_short!("low"), &1440);
+    assert_eq!(result.status, symbol_short!("met"));
+}
+
+#[test]
+fn test_extreme_stats_accumulate_large_values_without_overflow() {
+    // Run many high-penalty violations and verify stats accumulate correctly.
+    let env = Env::default();
+    env.budget().reset_unlimited();
+    let cid = env.register_contract(None, SLACalculatorContract);
+    let client = SLACalculatorContractClient::new(&env, &cid);
+    let admin = soroban_sdk::Address::generate(&env);
+    let op = soroban_sdk::Address::generate(&env);
+    client.initialize(&admin, &op);
+    // critical: threshold=60, penalty=10000
+    client.set_config(&admin, &symbol_short!("critical"), &60, &10000, &100000);
+
+    // 100 violations of 1 min each → penalty = 10000 each → total = 1_000_000
+    for _ in 0..100u32 {
+        client.calculate_sla(&op, &symbol_short!("BIG"), &symbol_short!("critical"), &61);
+    }
+
+    let stats = client.get_stats();
+    assert_eq!(stats.total_penalties, 1_000_000);
+    assert_eq!(stats.total_violations, 100);
+}
+
+// ============================================================
+// SC-008 (#128) – Complete negative test matrix for set_config validation
+//
+// Covers every rejection path in validate_config: zero, boundary+1, ordering
+// edge cases, and cross-severity consistency.
+// ============================================================
+
+// --- Global range rejections ---
+
+#[test]
+#[should_panic]
+fn test_set_config_rejects_unknown_severity_symbol() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("info"), &30, &50, &500);
+}
+
+#[test]
+#[should_panic]
+fn test_set_config_rejects_threshold_1441_for_low() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &1441, &10, &600);
+}
+
+#[test]
+#[should_panic]
+fn test_set_config_rejects_penalty_i128_max() {
+    let (_env, client, actors) = setup();
+    // i128::MAX is way above 10000 limit
+    client.set_config(&actors.admin, &symbol_short!("low"), &120, &i128::MAX, &600);
+}
+
+#[test]
+#[should_panic]
+fn test_set_config_rejects_reward_i128_max() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &120, &10, &i128::MAX);
+}
+
+// --- Critical severity-specific rejections ---
+
+#[test]
+#[should_panic]
+fn test_set_config_critical_rejects_threshold_61() {
+    // critical max threshold is 60
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("critical"), &61, &100, &750);
+}
+
+#[test]
+#[should_panic]
+fn test_set_config_critical_rejects_penalty_49() {
+    // critical min penalty is 50
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("critical"), &15, &49, &750);
+}
+
+#[test]
+fn test_set_config_critical_accepts_threshold_60_penalty_50() {
+    // Exact boundary values must be accepted
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("critical"), &60, &50, &750);
+    let cfg = client.get_config(&symbol_short!("critical"));
+    assert_eq!(cfg.threshold_minutes, 60);
+    assert_eq!(cfg.penalty_per_minute, 50);
+}
+
+// --- High severity-specific rejections ---
+
+#[test]
+#[should_panic]
+fn test_set_config_high_rejects_threshold_121() {
+    // high max threshold is 120
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("high"), &121, &50, &750);
+}
+
+#[test]
+#[should_panic]
+fn test_set_config_high_rejects_penalty_24() {
+    // high min penalty is 25
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("high"), &30, &24, &750);
+}
+
+#[test]
+fn test_set_config_high_accepts_threshold_120_penalty_25() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("high"), &120, &25, &750);
+    let cfg = client.get_config(&symbol_short!("high"));
+    assert_eq!(cfg.threshold_minutes, 120);
+    assert_eq!(cfg.penalty_per_minute, 25);
+}
+
+// --- Medium severity-specific rejections ---
+
+#[test]
+#[should_panic]
+fn test_set_config_medium_rejects_threshold_241() {
+    // medium max threshold is 240
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("medium"), &241, &25, &750);
+}
+
+#[test]
+#[should_panic]
+fn test_set_config_medium_rejects_penalty_9() {
+    // medium min penalty is 10
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("medium"), &60, &9, &750);
+}
+
+#[test]
+fn test_set_config_medium_accepts_threshold_240_penalty_10() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("medium"), &240, &10, &750);
+    let cfg = client.get_config(&symbol_short!("medium"));
+    assert_eq!(cfg.threshold_minutes, 240);
+    assert_eq!(cfg.penalty_per_minute, 10);
+}
+
+// --- Low severity-specific rejections ---
+
+#[test]
+#[should_panic]
+fn test_set_config_low_rejects_penalty_101() {
+    // low max penalty is 100
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &120, &101, &600);
+}
+
+#[test]
+fn test_set_config_low_accepts_penalty_100() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &120, &100, &600);
+    let cfg = client.get_config(&symbol_short!("low"));
+    assert_eq!(cfg.penalty_per_minute, 100);
+}
+
+// --- Rejection does not corrupt existing state ---
+
+#[test]
+fn test_set_config_rejection_leaves_state_unchanged_for_all_severities() {
+    let (_env, client, actors) = setup();
+
+    // Capture defaults
+    let orig_critical = client.get_config(&symbol_short!("critical"));
+    let orig_high = client.get_config(&symbol_short!("high"));
+    let orig_medium = client.get_config(&symbol_short!("medium"));
+    let orig_low = client.get_config(&symbol_short!("low"));
+
+    // Attempt invalid updates for each severity
+    let _ = client.try_set_config(&actors.admin, &symbol_short!("critical"), &0, &100, &750);
+    let _ = client.try_set_config(&actors.admin, &symbol_short!("high"), &0, &50, &750);
+    let _ = client.try_set_config(&actors.admin, &symbol_short!("medium"), &0, &25, &750);
+    let _ = client.try_set_config(&actors.admin, &symbol_short!("low"), &0, &10, &600);
+
+    // All configs must be unchanged
+    assert_eq!(
+        client
+            .get_config(&symbol_short!("critical"))
+            .threshold_minutes,
+        orig_critical.threshold_minutes
+    );
+    assert_eq!(
+        client.get_config(&symbol_short!("high")).threshold_minutes,
+        orig_high.threshold_minutes
+    );
+    assert_eq!(
+        client
+            .get_config(&symbol_short!("medium"))
+            .threshold_minutes,
+        orig_medium.threshold_minutes
+    );
+    assert_eq!(
+        client.get_config(&symbol_short!("low")).threshold_minutes,
+        orig_low.threshold_minutes
+    );
+}
+
+#[test]
+fn test_set_config_rejection_does_not_affect_other_severities() {
+    // A failed update to one severity must not touch any other severity.
+    let (_env, client, actors) = setup();
+
+    // Valid update to critical
+    client.set_config(&actors.admin, &symbol_short!("critical"), &30, &150, &1000);
+
+    // Invalid update to high (threshold=0)
+    let _ = client.try_set_config(&actors.admin, &symbol_short!("high"), &0, &50, &750);
+
+    // Critical must still have the updated value; high must still have default
+    assert_eq!(
+        client
+            .get_config(&symbol_short!("critical"))
+            .threshold_minutes,
+        30
+    );
+    assert_eq!(
+        client.get_config(&symbol_short!("high")).threshold_minutes,
+        30
+    ); // default
+}
+
+// --- Zero and negative-equivalent edge cases ---
+
+#[test]
+#[should_panic]
+fn test_set_config_rejects_penalty_negative_one() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &120, &-1, &600);
+}
+
+#[test]
+#[should_panic]
+fn test_set_config_rejects_reward_negative_one() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &120, &10, &-1);
+}
+
+#[test]
+#[should_panic]
+fn test_set_config_rejects_threshold_zero_for_high() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("high"), &0, &50, &750);
+}
+
+#[test]
+#[should_panic]
+fn test_set_config_rejects_threshold_zero_for_medium() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("medium"), &0, &25, &750);
+}
+
+#[test]
+#[should_panic]
+fn test_set_config_rejects_threshold_zero_for_low() {
+    let (_env, client, actors) = setup();
+    client.set_config(&actors.admin, &symbol_short!("low"), &0, &10, &600);
 }

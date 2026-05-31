@@ -173,6 +173,45 @@ Optional local outputs include:
 - debug build artifacts under `apexchainx_calculator/target/debug`
 - test binaries under `apexchainx_calculator/target/debug/deps`
 
+## Release Artifact Hash Manifest (SC-003)
+
+Every CI run and release tag produces a `manifest.sha256` file alongside the
+WASM artifact. The manifest contains the SHA-256 hash of `apexchainx_calculator.wasm`
+in standard `sha256sum` format:
+
+```
+<sha256hex>  apexchainx_calculator.wasm
+```
+
+### Verify a local build matches the recorded manifest
+
+```bash
+# 1. Build the release WASM locally
+cd apexchainx_calculator
+cargo build --release --target wasm32-unknown-unknown
+
+# 2. Download manifest.sha256 from the corresponding CI run or GitHub Release
+
+# 3. Copy the WASM next to the manifest and verify
+cp target/wasm32-unknown-unknown/release/apexchainx_calculator.wasm .
+sha256sum -c manifest.sha256
+# Expected output: apexchainx_calculator.wasm: OK
+```
+
+### Generate a manifest locally
+
+```bash
+cd apexchainx_calculator
+cargo build --release --target wasm32-unknown-unknown
+sha256sum target/wasm32-unknown-unknown/release/apexchainx_calculator.wasm \
+  | awk '{print $1 "  apexchainx_calculator.wasm"}' > manifest.sha256
+cat manifest.sha256
+```
+
+The `release-hash` workflow (`.github/workflows/release-hash.yml`) runs
+automatically on every push to `main`, every PR, and every `v*` tag. On tag
+pushes the manifest and WASM are attached to the GitHub Release.
+
 ## Verification Notes
 
 As of the latest stabilization pass:
@@ -180,6 +219,26 @@ As of the latest stabilization pass:
 - `cargo test` passes
 - the crate compiles cleanly
 - the checked-in test suite is wired into the crate and runs
+
+### no-std Compliance
+
+Soroban contracts run inside a WASM sandbox that has no operating system and no
+Rust standard library.  The crate is declared `#![no_std]` to enforce this at
+the source level, but `cargo test` on the host re-enables `std` via the test
+harness — so a stray `use std::vec::Vec` or `println!` would compile fine in
+tests yet fail at deployment.
+
+The CI pipeline therefore includes a dedicated **no-std compliance check**:
+
+```bash
+cargo check --target wasm32-unknown-unknown --lib
+```
+
+This compiles only the library crate (not the test harness) for the
+`wasm32-unknown-unknown` target, which has no `std`.  Any accidental `std`
+import surfaces as a compile error here before it can reach a deployed contract.
+The step runs after the host tests so regressions are caught in the same PR that
+introduces them.
 
 The current test suite covers:
 
@@ -223,6 +282,8 @@ Admin authority is transferred via a two-step flow to prevent accidental reassig
 
 The old admin retains authority until `accept_admin` succeeds. `get_pending_admin()` is queryable at any time.
 
+To cancel a stale or mistaken proposal before it is accepted, the current admin calls `cancel_admin_proposal(caller)`. This clears the pending proposal without changing the active admin. The call returns an error if no proposal is pending. After cancellation the admin may issue a fresh `propose_admin` for a different address.
+
 ### Operator handoff (two-step)
 
 Operator rotation follows the same pattern:
@@ -231,6 +292,8 @@ Operator rotation follows the same pattern:
 2. New operator calls `accept_operator(caller)` to activate.
 
 `get_pending_operator()` exposes the pending state for governance visibility.
+
+To cancel a pending operator proposal, the admin calls `cancel_operator_proposal(caller)`. The active operator is unchanged. A fresh `propose_operator` may be issued immediately after cancellation.
 
 ### Admin renounce
 

@@ -69,9 +69,11 @@ const EVENT_PRUNED: Symbol = symbol_short!("pruned");
 const EVENT_PRUNED_AGE: Symbol = symbol_short!("pruned_a"); // SC-063
 const EVENT_ADMIN_PROP: Symbol = symbol_short!("adm_prop"); // #63
 const EVENT_ADMIN_ACC: Symbol = symbol_short!("adm_acc"); // #63
+const EVENT_ADMIN_CAN: Symbol = symbol_short!("adm_can"); // SC-024
 const EVENT_ADMIN_REN: Symbol = symbol_short!("adm_ren"); // #65
 const EVENT_OP_PROP: Symbol = symbol_short!("op_prop"); // #64
 const EVENT_OP_ACC: Symbol = symbol_short!("op_acc"); // #64
+const EVENT_OP_CAN: Symbol = symbol_short!("op_can"); // SC-024
 const EVENT_VERSION: Symbol = symbol_short!("v1");
 
 // -----------------------------------------------------------------------
@@ -86,12 +88,12 @@ pub enum SLAError {
     Unauthorized = 3,
     ConfigNotFound = 4,
     VersionMismatch = 5,
-    ContractPaused = 6,    // #27
-    NoPendingTransfer = 7, // #63 #64
-    InvalidThreshold = 8,   // #70
-    InvalidPenalty = 9,    // #70
-    InvalidReward = 10,    // #70
-    InvalidSeverity = 11,  // #70
+    ContractPaused = 6,            // #27
+    NoPendingTransfer = 7,         // #63 #64
+    InvalidThreshold = 8,          // #70
+    InvalidPenalty = 9,            // #70
+    InvalidReward = 10,            // #70
+    InvalidSeverity = 11,          // #70
     RetentionLimitOutOfRange = 12, // SC-013
 }
 
@@ -116,6 +118,7 @@ pub struct SLAResult {
     pub amount: i128,         // negative = penalty, positive = reward
     pub payment_type: Symbol, // "rew" | "pen"
     pub rating: Symbol,       // "top" | "excel" | "good" | "poor"
+    pub config_version_hash: u64, // deterministic binding to config used for evaluation
     pub recorded_at: u64,     // SC-063: ledger timestamp at calculation time
 }
 
@@ -146,6 +149,7 @@ pub struct SLAResultSchema {
     pub rating_excellent: Symbol,
     pub rating_good: Symbol,
     pub rating_poor: Symbol,
+    pub includes_config_version_hash: bool,
 }
 
 /// #60 – Single introspection call for backend clients.
@@ -299,8 +303,13 @@ impl SLACalculatorContract {
     // -------------------------------------------------------------------
 
     /// Migrate storage from a previous version to the current one.
+    ///
     /// Must be called by admin after a contract upgrade that bumps STORAGE_VERSION.
-    /// Currently handles v0→v1 (first-time version stamp on legacy state).
+    /// The harness applies each step in sequence (v0→v1, v1→v2, …) so a contract
+    /// that is multiple versions behind is brought fully up to date in one call.
+    /// Re-invoking when already current is a safe no-op (idempotent).
+    /// If an unknown stored version is encountered the call returns
+    /// `VersionMismatch` without mutating any state.
     pub fn migrate(env: Env, caller: Address) -> Result<(), SLAError> {
         // Require admin without going through check_version (state may be unversioned)
         let admin: Address = env
@@ -318,18 +327,41 @@ impl SLACalculatorContract {
             .get(&STORAGE_VERSION_KEY)
             .unwrap_or(0);
 
+        // Already current – idempotent no-op
         if stored == STORAGE_VERSION {
-            // Already current – idempotent no-op
             return Ok(());
         }
+
+        // Reject versions newer than what this binary knows about
+        if stored > STORAGE_VERSION {
+            return Err(SLAError::VersionMismatch);
+        }
+
+        // Apply each step in sequence.  Each arm must be a pure, atomic
+        // transformation: read old state → write new state → bump version.
+        // A future version bump adds a new arm here; existing arms are never
+        // modified so older migration paths remain auditable.
+        let mut current = stored;
 
         // v0 → v1: stamp the version; all other fields were set by initialize
-        if stored == 0 {
-            Self::write_version(&env);
-            return Ok(());
+        if current == 0 {
+            env.storage().instance().set(&STORAGE_VERSION_KEY, &1u32);
+            current = 1;
         }
 
-        Err(SLAError::VersionMismatch)
+        // v1 → v2 (placeholder for the next breaking state change):
+        // if current == 1 {
+        //     // … transform state …
+        //     env.storage().instance().set(&STORAGE_VERSION_KEY, &2u32);
+        //     current = 2;
+        // }
+
+        // Sanity: after all steps we must be at STORAGE_VERSION
+        if current != STORAGE_VERSION {
+            return Err(SLAError::VersionMismatch);
+        }
+
+        Ok(())
     }
 
     // -------------------------------------------------------------------
@@ -406,6 +438,21 @@ impl SLACalculatorContract {
         Ok(())
     }
 
+    /// Cancel a pending admin transfer. Only the current admin may cancel.
+    /// Clears the pending proposal without changing the active admin.
+    /// Returns `NoPendingTransfer` if there is nothing to cancel.
+    pub fn cancel_admin_proposal(env: Env, caller: Address) -> Result<(), SLAError> {
+        Self::check_version(&env)?;
+        Self::require_admin(&env, &caller)?;
+        if !env.storage().instance().has(&PENDING_ADMIN_KEY) {
+            return Err(SLAError::NoPendingTransfer);
+        }
+        env.storage().instance().remove(&PENDING_ADMIN_KEY);
+        env.events()
+            .publish((EVENT_ADMIN_CAN, EVENT_VERSION, caller), ());
+        Ok(())
+    }
+
     /// Returns the pending admin address, if any.
     pub fn get_pending_admin(env: Env) -> Result<Option<Address>, SLAError> {
         Self::check_version(&env)?;
@@ -424,9 +471,7 @@ impl SLACalculatorContract {
     ) -> Result<(), SLAError> {
         Self::check_version(&env)?;
         Self::require_admin(&env, &caller)?;
-        env.storage()
-            .instance()
-            .set(&PENDING_OP_KEY, &new_operator);
+        env.storage().instance().set(&PENDING_OP_KEY, &new_operator);
         env.events()
             .publish((EVENT_OP_PROP, EVENT_VERSION, caller), (new_operator,));
         Ok(())
@@ -447,6 +492,21 @@ impl SLACalculatorContract {
         env.storage().instance().remove(&PENDING_OP_KEY);
         env.events()
             .publish((EVENT_OP_ACC, EVENT_VERSION, caller), ());
+        Ok(())
+    }
+
+    /// Cancel a pending operator proposal. Only the current admin may cancel.
+    /// Clears the pending proposal without changing the active operator.
+    /// Returns `NoPendingTransfer` if there is nothing to cancel.
+    pub fn cancel_operator_proposal(env: Env, caller: Address) -> Result<(), SLAError> {
+        Self::check_version(&env)?;
+        Self::require_admin(&env, &caller)?;
+        if !env.storage().instance().has(&PENDING_OP_KEY) {
+            return Err(SLAError::NoPendingTransfer);
+        }
+        env.storage().instance().remove(&PENDING_OP_KEY);
+        env.events()
+            .publish((EVENT_OP_CAN, EVENT_VERSION, caller), ());
         Ok(())
     }
 
@@ -529,9 +589,14 @@ impl SLACalculatorContract {
     ) -> Result<(), SLAError> {
         Self::check_version(&env)?;
         Self::require_admin(&env, &caller)?; // #28 – admin role enforced
-        
+
         // #70 – Validate configuration parameters
-        Self::validate_config(&severity, threshold_minutes, penalty_per_minute, reward_base)?;
+        Self::validate_config(
+            &severity,
+            threshold_minutes,
+            penalty_per_minute,
+            reward_base,
+        )?;
 
         let mut configs: Map<Symbol, SLAConfig> = env
             .storage()
@@ -574,14 +639,8 @@ impl SLACalculatorContract {
         Self::check_version(&env)?;
 
         let mut entries = Vec::new(&env);
-        let severities = [
-            symbol_short!("critical"),
-            symbol_short!("high"),
-            symbol_short!("medium"),
-            symbol_short!("low"),
-        ];
 
-        for severity in severities {
+        for severity in Self::canonical_severities(&env) {
             let config = Self::load_config(&env, &severity)?;
             entries.push_back(SLAConfigEntry { severity, config });
         }
@@ -597,57 +656,53 @@ impl SLACalculatorContract {
     ///
     /// The hash uses a polynomial rolling hash with a prime base and modulus
     /// to provide strong collision resistance while remaining deterministic.
-    /// It processes all severity config fields in canonical order 
+    /// It processes all severity config fields in canonical order
     /// (critical → high → medium → low) and is stable across repeated reads
     /// when config is unchanged.
     pub fn get_config_version_hash(env: Env) -> Result<u64, SLAError> {
         Self::check_version(&env)?;
-        let severities = [
-            symbol_short!("critical"),
-            symbol_short!("high"),
-            symbol_short!("medium"),
-            symbol_short!("low"),
-        ];
-        
+        Self::compute_config_version_hash(&env)
+        let severities = Self::canonical_severities(&env);
+
         // Polynomial rolling hash parameters for good collision resistance
         const BASE: u64 = 91138233; // Large prime number
         const MODULUS: u64 = (1u64 << 63) - 25; // Large prime (Mersenne-like)
-        
+
         let mut hash: u64 = 1; // Start with non-zero seed
         let mut power: u64 = 1;
-        
+
         for sev in severities {
             let cfg = Self::load_config(&env, &sev)?;
-            
+
             // Mix each field with position-dependent weights
             let field_hash = hash
                 .wrapping_mul(BASE)
                 .wrapping_add(cfg.threshold_minutes as u64)
                 .wrapping_mul(power)
                 % MODULUS;
-            
+
             hash = field_hash;
             power = power.wrapping_mul(BASE) % MODULUS;
-            
+
             // Add penalty_per_minute with different weight
             hash = hash
                 .wrapping_mul(BASE)
                 .wrapping_add(cfg.penalty_per_minute as u64)
                 .wrapping_mul(power)
                 % MODULUS;
-            
+
             power = power.wrapping_mul(BASE) % MODULUS;
-            
+
             // Add reward_base with different weight
             hash = hash
                 .wrapping_mul(BASE)
                 .wrapping_add(cfg.reward_base as u64)
                 .wrapping_mul(power)
                 % MODULUS;
-            
+
             power = power.wrapping_mul(BASE) % MODULUS;
         }
-        
+
         // Final mixing to improve distribution
         hash = hash.wrapping_mul(BASE).wrapping_add(0x9e3779b97f4a7c15u64) % MODULUS;
         Ok(hash)
@@ -666,17 +721,14 @@ impl SLACalculatorContract {
             rating_excellent: symbol_short!("excel"),
             rating_good: symbol_short!("good"),
             rating_poor: symbol_short!("poor"),
+            includes_config_version_hash: true,
         })
     }
 
     /// #60 – Returns static contract capabilities for backend introspection.
     pub fn get_contract_metadata(env: Env) -> Result<ContractMetadata, SLAError> {
         Self::check_version(&env)?;
-        let mut severities = Vec::new(&env);
-        severities.push_back(symbol_short!("critical"));
-        severities.push_back(symbol_short!("high"));
-        severities.push_back(symbol_short!("medium"));
-        severities.push_back(symbol_short!("low"));
+        let severities = Self::canonical_severities(&env);
 
         let mut features = Vec::new(&env);
         features.push_back(symbol_short!("calc"));
@@ -722,9 +774,21 @@ impl SLACalculatorContract {
         Self::check_version(&env)?;
         // We bypass pause and operator checks to allow continuous, public verification
         let cfg = Self::load_config(&env, &severity)?;
+        let config_version_hash = Self::compute_config_version_hash(&env)?;
 
-        // Delegate to pure internal math; recorded_at=0 for view-only calls
-        Ok(Self::compute_result(outage_id, mttr_minutes, &cfg, 0))
+        // Delegate to pure internal math without mutating state or emitting events.
+
+        // Use the current ledger timestamp so the view result matches the mutating
+        // path for the same inputs executed in the same ledger, while still avoiding
+        // any state writes or event emission.
+        Ok(Self::compute_result(
+            outage_id,
+            mttr_minutes,
+            &cfg,
+            config_version_hash,
+            0,
+            env.ledger().timestamp(),
+        ))
     }
 
     // -------------------------------------------------------------------
@@ -743,7 +807,14 @@ impl SLACalculatorContract {
         Self::require_operator(&env, &caller)?; // #28
 
         let cfg = Self::load_config(&env, &severity)?;
-        let result = Self::compute_result(outage_id.clone(), mttr_minutes, &cfg, env.ledger().timestamp());
+        let config_version_hash = Self::compute_config_version_hash(&env)?;
+        let result = Self::compute_result(
+            outage_id.clone(),
+            mttr_minutes,
+            &cfg,
+            config_version_hash,
+            env.ledger().timestamp(),
+        );
         let mut history: Vec<SLAResult> = env
             .storage()
             .instance()
@@ -789,8 +860,17 @@ impl SLACalculatorContract {
     // -------------------------------------------------------------------
 
     /// Pure helper to generate the SLAResult deterministically.
+    /// `config_version_hash` binds the result to the exact config snapshot used
+    /// during evaluation. `recorded_at` is the ledger timestamp at call time
+    /// (0 in view/audit mode).
     /// `recorded_at` is the ledger timestamp at call time (0 in view/audit mode).
-    fn compute_result(outage_id: Symbol, mttr_minutes: u32, cfg: &SLAConfig, recorded_at: u64) -> SLAResult {
+    fn compute_result(
+        outage_id: Symbol,
+        mttr_minutes: u32,
+        cfg: &SLAConfig,
+        config_version_hash: u64,
+        recorded_at: u64,
+    ) -> SLAResult {
         let threshold = cfg.threshold_minutes;
 
         // Case 1: SLA violated → penalty
@@ -806,6 +886,7 @@ impl SLACalculatorContract {
                 amount: -penalty,
                 payment_type: symbol_short!("pen"),
                 rating: symbol_short!("poor"),
+                config_version_hash,
                 recorded_at,
             }
         } else {
@@ -834,6 +915,7 @@ impl SLACalculatorContract {
                 amount: reward,
                 payment_type: symbol_short!("rew"),
                 rating,
+                config_version_hash,
                 recorded_at,
             }
         }
@@ -899,13 +981,7 @@ impl SLACalculatorContract {
         reward_base: i128,
     ) -> Result<(), SLAError> {
         // Validate severity is one of the supported values
-        let valid_severities = [
-            symbol_short!("critical"),
-            symbol_short!("high"),
-            symbol_short!("medium"),
-            symbol_short!("low"),
-        ];
-        if !valid_severities.contains(severity) {
+        if !Self::is_canonical_severity(severity) {
             return Err(SLAError::InvalidSeverity);
         }
 
@@ -961,7 +1037,76 @@ impl SLACalculatorContract {
         Ok(())
     }
 
+    fn canonical_severities(env: &Env) -> Vec<Symbol> {
+        let mut severities = Vec::new(env);
+        severities.push_back(symbol_short!("critical"));
+        severities.push_back(symbol_short!("high"));
+        severities.push_back(symbol_short!("medium"));
+        severities.push_back(symbol_short!("low"));
+        severities
+    }
+
+    fn canonical_severity_index(severity: &Symbol) -> Option<u32> {
+        if *severity == symbol_short!("critical") {
+            Some(0)
+        } else if *severity == symbol_short!("high") {
+            Some(1)
+        } else if *severity == symbol_short!("medium") {
+            Some(2)
+        } else if *severity == symbol_short!("low") {
+            Some(3)
+        } else {
+            None
+        }
+    }
+
+    fn is_canonical_severity(severity: &Symbol) -> bool {
+        Self::canonical_severity_index(severity).is_some()
+    }
+
     /// Shared config lookup that borrows env (avoids consuming it).
+    fn compute_config_version_hash(env: &Env) -> Result<u64, SLAError> {
+        let severities = [
+            symbol_short!("critical"),
+            symbol_short!("high"),
+            symbol_short!("medium"),
+            symbol_short!("low"),
+        ];
+
+        const BASE: u64 = 91138233;
+        const MODULUS: u64 = (1u64 << 63) - 25;
+
+        let mut hash: u64 = 1;
+        let mut power: u64 = 1;
+
+        for sev in severities {
+            let cfg = Self::load_config(env, &sev)?;
+
+            hash = hash
+                .wrapping_mul(BASE)
+                .wrapping_add(cfg.threshold_minutes as u64)
+                .wrapping_mul(power)
+                % MODULUS;
+            power = power.wrapping_mul(BASE) % MODULUS;
+
+            hash = hash
+                .wrapping_mul(BASE)
+                .wrapping_add(cfg.penalty_per_minute as u64)
+                .wrapping_mul(power)
+                % MODULUS;
+            power = power.wrapping_mul(BASE) % MODULUS;
+
+            hash = hash
+                .wrapping_mul(BASE)
+                .wrapping_add(cfg.reward_base as u64)
+                .wrapping_mul(power)
+                % MODULUS;
+            power = power.wrapping_mul(BASE) % MODULUS;
+        }
+
+        Ok(hash.wrapping_mul(BASE).wrapping_add(0x9e3779b97f4a7c15u64) % MODULUS)
+    }
+
     fn load_config(env: &Env, severity: &Symbol) -> Result<SLAConfig, SLAError> {
         let configs: Map<Symbol, SLAConfig> = env
             .storage()
@@ -1099,10 +1244,8 @@ impl SLACalculatorContract {
         if removed > 0 {
             let kept = new_history.len();
             env.storage().instance().set(&HISTORY_KEY, &new_history);
-            env.events().publish(
-                (EVENT_PRUNED_AGE, EVENT_VERSION, caller),
-                (removed, kept),
-            );
+            env.events()
+                .publish((EVENT_PRUNED_AGE, EVENT_VERSION, caller), (removed, kept));
         }
 
         Ok(())
@@ -1140,10 +1283,7 @@ impl SLACalculatorContract {
 
     /// Returns all history entries whose `outage_id` matches the given value.
     /// Returns an empty Vec when no matching entries exist.
-    pub fn get_history_by_outage(
-        env: Env,
-        outage_id: Symbol,
-    ) -> Result<Vec<SLAResult>, SLAError> {
+    pub fn get_history_by_outage(env: Env, outage_id: Symbol) -> Result<Vec<SLAResult>, SLAError> {
         Self::check_version(&env)?;
         let history: Vec<SLAResult> = env
             .storage()
