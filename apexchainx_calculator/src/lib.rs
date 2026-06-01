@@ -746,6 +746,7 @@ impl SLACalculatorContract {
         })
     }
 
+
     pub fn get_result_schema(env: Env) -> Result<SLAResultSchema, SLAError> {
         Self::check_version(&env)?;
         Ok(SLAResultSchema {
@@ -820,13 +821,13 @@ impl SLACalculatorContract {
         // Use the current ledger timestamp so the view result matches the mutating
         // path for the same inputs executed in the same ledger, while still avoiding
         // any state writes or event emission.
-        Ok(Self::compute_result(
+        Self::compute_result(
             outage_id,
             mttr_minutes,
             &cfg,
             config_version_hash,
             env.ledger().timestamp(),
-        ))
+        )
     }
 
     // -------------------------------------------------------------------
@@ -852,7 +853,7 @@ impl SLACalculatorContract {
             &cfg,
             config_version_hash,
             env.ledger().timestamp(),
-        );
+        )?;
         let mut history: Vec<SLAResult> = env
             .storage()
             .instance()
@@ -870,7 +871,7 @@ impl SLACalculatorContract {
             // Explicit duplicate policy: same outage_id is idempotent only when
             // execution inputs resolve to the same deterministic result.
             if prev.mttr_minutes != mttr_minutes || prev.threshold_minutes != cfg.threshold_minutes {
-                panic!("duplicate outage_id with mismatched execution inputs");
+                return Err(SLAError::DuplicateOutageInput);
             }
             return Ok(prev);
         }
@@ -918,14 +919,13 @@ impl SLACalculatorContract {
     /// `config_version_hash` binds the result to the exact config snapshot used
     /// during evaluation. `recorded_at` is the ledger timestamp at call time
     /// (0 in view/audit mode).
-    /// `recorded_at` is the ledger timestamp at call time (0 in view/audit mode).
     fn compute_result(
         outage_id: Symbol,
         mttr_minutes: u32,
         cfg: &SLAConfig,
         config_version_hash: u64,
         recorded_at: u64,
-    ) -> SLAResult {
+    ) -> Result<SLAResult, SLAError> {
         let threshold = cfg.threshold_minutes;
 
         // Case 1: SLA violated → penalty
@@ -934,10 +934,10 @@ impl SLACalculatorContract {
             let penalty = overtime.saturating_mul(cfg.penalty_per_minute);
             let amount = -penalty;
             if amount >= 0 {
-                panic!("invalid penalty amount");
+                return Err(SLAError::InvalidPenaltyAmount);
             }
 
-            SLAResult {
+            Ok(SLAResult {
                 outage_id,
                 status: symbol_short!("viol"),
                 mttr_minutes,
@@ -947,7 +947,7 @@ impl SLACalculatorContract {
                 rating: symbol_short!("poor"),
                 config_version_hash,
                 recorded_at,
-            }
+            })
         } else {
             // Case 2: SLA met → reward
             let performance_ratio = if threshold == 0 {
@@ -969,10 +969,10 @@ impl SLACalculatorContract {
                 .saturating_mul(multiplier as i128)
                 .div_euclid(100);
             if reward <= 0 {
-                panic!("invalid reward amount");
+                return Err(SLAError::InvalidRewardAmount);
             }
 
-            SLAResult {
+            Ok(SLAResult {
                 outage_id,
                 status: symbol_short!("met"),
                 mttr_minutes,
@@ -982,7 +982,7 @@ impl SLACalculatorContract {
                 rating,
                 config_version_hash,
                 recorded_at,
-            }
+            })
         }
     }
 
