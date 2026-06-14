@@ -26,37 +26,66 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # --------------------------------------------------------------------
+      # Step 0: Checkout & Toolchain Setup
+      # --------------------------------------------------------------------
       - uses: actions/checkout@v4
 
-      - name: Install Rust toolchain
+      - name: Install Rust toolchain with wasm32 target
         uses: dtolnay/rust-toolchain@stable
         with:
           targets: wasm32-unknown-unknown
 
+      # --------------------------------------------------------------------
+      # Dependency Caching
+      # --------------------------------------------------------------------
+      # Caches compiled dependencies across runs to speed up builds.
       - name: Cache Cargo dependencies
         uses: Swatinem/rust-cache@v2
         with:
           workspaces: apexchainx_calculator
 
+      # --------------------------------------------------------------------
+      # Step 1: Build Release WASM
+      # --------------------------------------------------------------------
+      # Compiles the contract for the wasm32-unknown-unknown target in
+      # release mode, producing the deployable binary. This is the same
+      # artifact that will be deployed to the Stellar network.
       - name: Build release WASM
         run: cargo build --release --manifest-path apexchainx_calculator/Cargo.toml --target wasm32-unknown-unknown
 
+      # --------------------------------------------------------------------
+      # Step 2: Generate SHA-256 Manifest
+      # --------------------------------------------------------------------
+      # Computes the SHA-256 hash of the release WASM binary and writes
+      # it to manifest.sha256 in standard sha256sum format.
+      # Also logs the artifact size for reference.
       - name: Generate SHA-256 manifest
         run: |
           WASM=apexchainx_calculator/target/wasm32-unknown-unknown/release/apexchainx_calculator.wasm
           sha256sum "$WASM" | awk '{print $1 "  apexchainx_calculator.wasm"}' > manifest.sha256
           echo "=== manifest.sha256 ==="
           cat manifest.sha256
-          echo "=== artifact size ==="
+          echo "=== artifact size (bytes) ==="
           wc -c < "$WASM"
 
-      - name: Verify manifest is self-consistent
+      # --------------------------------------------------------------------
+      # Step 3: Self-Consistency Verification
+      # --------------------------------------------------------------------
+      # Verifies that the manifest matches the binary by running
+      # sha256sum --check against the just-generated manifest.
+      # This ensures the manifest is valid before it's uploaded.
+      - name: Verify manifest self-consistency
         run: |
-          # Copy the WASM next to the manifest and verify
           cp apexchainx_calculator/target/wasm32-unknown-unknown/release/apexchainx_calculator.wasm .
           sha256sum -c manifest.sha256
           rm apexchainx_calculator.wasm
 
+      # --------------------------------------------------------------------
+      # Step 4: Upload Artifact
+      # --------------------------------------------------------------------
+      # Uploads the manifest and WASM binary as a workflow artifact.
+      # Retained for 90 days to allow post-release verification.
       - name: Upload manifest as workflow artifact
         uses: actions/upload-artifact@v4
         with:
@@ -66,7 +95,12 @@ jobs:
             apexchainx_calculator/target/wasm32-unknown-unknown/release/apexchainx_calculator.wasm
           retention-days: 90
 
-      # Attach manifest to GitHub Release when triggered by a version tag
+      # --------------------------------------------------------------------
+      # Step 5: Attach to GitHub Release (tagged builds only)
+      # --------------------------------------------------------------------
+      # When triggered by a version tag (v*), attaches the manifest and
+      # WASM binary to the corresponding GitHub Release for easy download
+      # by operators and backend developers.
       - name: Attach manifest to GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
         uses: softprops/action-gh-release@v2
