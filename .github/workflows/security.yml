@@ -1,3 +1,24 @@
+# =============================================================================
+# ApexChainx Contracts — Security Audit
+# =============================================================================
+#
+# Reference: SC-099
+#
+# Purpose:
+#   Automated dependency security scanning using cargo-audit against the
+#   RustSec Advisory Database. Also surfaces the dependency tree for
+#   manual review of unexpected dependency additions.
+#
+# Triggered on:
+#   - Push to main branch (immediate feedback)
+#   - Pull requests targeting main (pre-merge gate)
+#   - Schedule: Every Monday 08:00 UTC (catch newly published advisories)
+#
+# Requirements:
+#   - cargo-audit must be installed (handled in pipeline)
+#   - Internet access to the RustSec Advisory Database
+# =============================================================================
+
 name: Security Audit
 
 on:
@@ -6,8 +27,7 @@ on:
   pull_request:
     branches: [main]
   schedule:
-    # Run every Monday at 08:00 UTC to catch newly published advisories
-    - cron: '0 8 * * 1'
+    - cron: '0 8 * * 1'  # Every Monday 08:00 UTC
 
 jobs:
   audit:
@@ -15,18 +35,35 @@ jobs:
     runs-on: ubuntu-latest
 
     steps:
+      # --------------------------------------------------------------------
+      # Step 0: Checkout & Toolchain Setup
+      # --------------------------------------------------------------------
       - uses: actions/checkout@v4
 
       - name: Install Rust toolchain
         uses: dtolnay/rust-toolchain@stable
 
+      # --------------------------------------------------------------------
+      # Step 1: Install cargo-audit
+      # --------------------------------------------------------------------
+      # cargo-audit checks the dependency tree against the RustSec Advisory
+      # Database. Must be compiled from source for the latest advisory data.
       - name: Install cargo-audit
         run: cargo install cargo-audit --locked
 
-      # SC-099 — audit all dependencies against the RustSec advisory database
+      # --------------------------------------------------------------------
+      # Step 2: Dependency Audit (SC-099)
+      # --------------------------------------------------------------------
+      # Audits all direct and transitive dependencies against known security
+      # advisories. Fails if any advisory matches a dependency version in
+      # use. Results are visible in the CI log.
       - name: Run cargo audit
         run: cargo audit --manifest-path apexchainx_calculator/Cargo.toml
 
-      # Surface the dependency tree so maintainers can spot unexpected additions
+      # --------------------------------------------------------------------
+      # Step 3: Dependency Tree Review
+      # --------------------------------------------------------------------
+      # Prints the full dependency tree (2 levels deep) so maintainers can
+      # spot unexpected or suspicious dependency additions during PR review.
       - name: Show dependency tree
         run: cargo tree --manifest-path apexchainx_calculator/Cargo.toml --depth 2
