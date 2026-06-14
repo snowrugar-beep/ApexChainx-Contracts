@@ -1,6 +1,15 @@
+<p align="center">
+  <img src="https://img.shields.io/badge/status-active-success.svg" alt="Status: Active">
+  <img src="https://img.shields.io/badge/license-MIT-blue.svg" alt="License: MIT">
+  <img src="https://img.shields.io/badge/version-0.1.0-blueviolet" alt="Version: 0.1.0">
+  <img src="https://img.shields.io/badge/Soroban_SDK-21.0.0-important" alt="Soroban SDK: 21.0.0">
+  <img src="https://img.shields.io/badge/rustc-stable-success" alt="Rust: stable">
+  <img src="https://img.shields.io/badge/platform-Stellar_Network-000" alt="Platform: Stellar Network">
+</p>
+
 # ApexChainx Smart Contracts
 
-Soroban contract repository for the ApexChainx system.
+> **Soroban-based SLA calculator and multi-contract coordination suite for the Stellar network.**
 
 This repository is the execution-layer side of the 3-repo architecture:
 
