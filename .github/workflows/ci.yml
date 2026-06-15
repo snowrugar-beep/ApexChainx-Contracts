@@ -2,10 +2,11 @@
 # ApexChainx Contracts — CI Pipeline
 # =============================================================================
 #
-# Triggered on push/PR to main. Essential checks only:
+# Triggered on push/PR to main. Essential checks:
 #   1. Formatting  (rustfmt)
 #   2. Linting     (clippy)
-#   3. Tests       (cargo test)
+#   3. Build       (cargo build)
+#   4. Tests       (cargo test)
 # =============================================================================
 
 name: CI
@@ -43,6 +44,9 @@ jobs:
 
       - name: Clippy linting
         run: cargo clippy --manifest-path apexchainx_calculator/Cargo.toml
+
+      - name: Build
+        run: cargo build --manifest-path apexchainx_calculator/Cargo.toml
 
       - name: Run tests
         run: cargo test --manifest-path apexchainx_calculator/Cargo.toml
